@@ -32,13 +32,22 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Force fetch SDL
-
+      - name: Initialize pinned git submodules
         shell: bash
         run: |
-          rm -rf vendor/SDL
-          git clone https://github.com/libsdl-org/SDL.git vendor/SDL
-          
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Ensure OpenAL Soft source exists
+        shell: bash
+        run: |
+          if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
+            echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
+            rm -rf vendor/openal-soft
+            git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
+          fi
+          test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
 
@@ -116,12 +125,21 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Force fetch SDL
-
+      - name: Initialize pinned git submodules
         shell: bash
         run: |
-          rm -rf vendor/SDL
-          git clone https://github.com/libsdl-org/SDL.git vendor/SDL
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Ensure OpenAL Soft source exists
+        shell: bash
+        run: |
+          if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
+            echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
+            rm -rf vendor/openal-soft
+            git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
+          fi
+          test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
 
       - name: Install Linux build dependencies
         run: |
@@ -192,12 +210,21 @@ jobs:
         fetch-depth: 0
         fetch-tags: true
 
-    - name: Force fetch SDL
-
+    - name: Initialize pinned git submodules
       shell: bash
       run: |
-        rm -rf vendor/SDL
-        git clone https://github.com/libsdl-org/SDL.git vendor/SDL
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+    - name: Ensure OpenAL Soft source exists
+      shell: bash
+      run: |
+        if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
+          echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
+          rm -rf vendor/openal-soft
+          git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
+        fi
+        test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
 
     - name: Cache Rust build artifacts
       uses: actions/cache@main
@@ -311,12 +338,21 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Force fetch SDL
-
+      - name: Initialize pinned git submodules
         shell: bash
         run: |
-          rm -rf vendor/SDL
-          git clone https://github.com/libsdl-org/SDL.git vendor/SDL
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Ensure OpenAL Soft source exists
+        shell: bash
+        run: |
+          if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
+            echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
+            rm -rf vendor/openal-soft
+            git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
+          fi
+          test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
 
       - name: Select the newest installed Xcode
         run: |
@@ -403,11 +439,21 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Force fetch SDL
+    - name: Initialize pinned git submodules
       shell: bash
       run: |
-        rm -rf vendor/SDL
-        git clone https://github.com/libsdl-org/SDL.git vendor/SDL
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+    - name: Ensure OpenAL Soft source exists
+      shell: bash
+      run: |
+        if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
+          echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
+          rm -rf vendor/openal-soft
+          git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
+        fi
+        test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
 
     - name: Cache Rust build artifacts
       uses: Swatinem/rust-cache@master
