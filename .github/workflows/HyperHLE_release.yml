@@ -396,10 +396,10 @@ jobs:
         submodules: recursive
 
     - name: Force fetch SDL
-      run: |
-        Remove-Item -Recurse -Force vendor/SDL -ErrorAction SilentlyContinue
-        git clone https://github.com/libsdl-org/SDL.git vendor/SDL
       shell: bash
+      run: |
+        rm -rf vendor/SDL
+        git clone https://github.com/libsdl-org/SDL.git vendor/SDL
 
     - name: Cache Rust build artifacts
       uses: Swatinem/rust-cache@master
@@ -517,7 +517,6 @@ jobs:
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files
         env:
-          # Lets the changelog look up each commit author's GitHub username.
           GH_TOKEN: ${{ github.token }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
