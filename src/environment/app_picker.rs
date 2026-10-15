@@ -201,21 +201,7 @@ fn save_picker_settings(s: &PersistedPickerSettings) {
     let lang_str = s.language_tag.map_or("default".to_string(), |t| t.to_string());
 
     let content = format!(
-        "# HyperHLE-Fork Persistent Settings
-         scale_hack={scale_str}
-         orientation={orient_str}
-         fullscreen={}
-         gles_native={gles_str}
-         force_composition={comp_str}
-         show_fps={}
-         trace_gl_errors={}
-         device_tag={dev_str}
-         ios_version_tag={ios_str}
-         language_tag={lang_str}
-         cheat_engine={ce_str}
-         network={}
-         analog_stick_tilt_controls={}
-",
+        "# HyperHLE-Fork Persistent Settings\nscale_hack={scale_str}\norientation={orient_str}\nfullscreen={}\ngles_native={gles_str}\nforce_composition={comp_str}\nshow_fps={}\ntrace_gl_errors={}\ndevice_tag={dev_str}\nios_version_tag={ios_str}\nlanguage_tag={lang_str}\ncheat_engine={ce_str}\nnetwork={}\nanalog_stick_tilt_controls={}\n",
         s.fullscreen,
         s.show_fps,
         s.trace_gl_errors,

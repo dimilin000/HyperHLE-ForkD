@@ -28,14 +28,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     instance
 }
 
++ (())load {}
++ (())start {}
++ (())setup {}
+
 - (id)init { this }
 - (id)retain { this }
 - (())release {}
 - (id)autorelease { this }
-
-+ (())load {}
-+ (())start {}
-+ (())setup {}
 - (())start {}
 - (())setup {}
 - (())show {}

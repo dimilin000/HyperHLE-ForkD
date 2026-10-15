@@ -411,7 +411,13 @@ jobs:
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
 
     - name: Build for Android
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk
+      run: |
+        if [ -f android/build.gradle ] && ! grep -q "maven-central.storage-download.googleapis.com" android/build.gradle; then
+          sed -i 's|mavenCentral()|maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }\n        mavenCentral()|g' android/build.gradle
+        fi
+        cd android
+        ../gradle/gradle-8.11.1/bin/gradle assembleRelease --no-daemon || ../gradle/gradle-8.11.1/bin/gradle assembleRelease --no-daemon --refresh-dependencies
+        mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk
       env:
         HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
         HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}

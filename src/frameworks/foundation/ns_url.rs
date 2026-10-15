@@ -670,30 +670,31 @@ pub const CLASSES: ClassExports = objc_classes! {
     if path_component == nil {
         return this;
     }
-    match *env.objc.borrow(this) {
-        NSURLHostObject::FileURL { ns_string, .. } => {
-            let mut path: id = msg![env; ns_string stringByAppendingPathComponent:path_component];
-            if is_directory {
-                path = msg![env; path stringByAppendingString:(get_static_str(env, "/"))];
-            }
-            msg_class![env; NSURL fileURLWithPath:path]
+    let (is_file, ns_string) = match *env.objc.borrow(this) {
+        NSURLHostObject::FileURL { ns_string, .. } => (true, ns_string),
+        NSURLHostObject::OtherURL { ns_string } => (false, ns_string),
+    };
+    if is_file {
+        let mut path: id = msg![env; ns_string stringByAppendingPathComponent:path_component];
+        if is_directory {
+            path = msg![env; path stringByAppendingString:(get_static_str(env, "/"))];
         }
-        NSURLHostObject::OtherURL { ns_string } => {
-            let base_str = to_rust_string(env, ns_string);
-            let comp_str = to_rust_string(env, path_component);
-            let mut joined = base_str.into_owned();
-            if !joined.ends_with('/') && !comp_str.starts_with('/') {
-                joined.push('/');
-            }
-            joined.push_str(comp_str.trim_start_matches('/'));
-            if is_directory && !joined.ends_with('/') {
-                joined.push('/');
-            }
-            let ns_joined = from_rust_string(env, joined);
-            let url: id = msg_class![env; NSURL URLWithString:ns_joined];
-            release(env, ns_joined);
-            url
+        msg_class![env; NSURL fileURLWithPath:path]
+    } else {
+        let base_str = to_rust_string(env, ns_string).into_owned();
+        let comp_str = to_rust_string(env, path_component).into_owned();
+        let mut joined = base_str;
+        if !joined.ends_with('/') && !comp_str.starts_with('/') {
+            joined.push('/');
         }
+        joined.push_str(comp_str.trim_start_matches('/'));
+        if is_directory && !joined.ends_with('/') {
+            joined.push('/');
+        }
+        let ns_joined = from_rust_string(env, joined);
+        let url: id = msg_class![env; NSURL URLWithString:ns_joined];
+        release(env, ns_joined);
+        url
     }
 }
 
