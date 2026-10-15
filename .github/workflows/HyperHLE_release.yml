@@ -38,6 +38,23 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
+      - name: Ensure pinned SDL source exists
+        shell: bash
+        run: |
+          set -eu
+          SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
+          SDL_DIR=vendor/SDL
+          if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
+            rm -rf "$SDL_DIR"
+            mkdir -p vendor
+            git init "$SDL_DIR"
+            git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
+            git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
+            git -C "$SDL_DIR" checkout --detach FETCH_HEAD
+          fi
+          test -f "$SDL_DIR/CMakeLists.txt"
+          test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
+
       - name: Ensure OpenAL Soft source exists
         shell: bash
         run: |
@@ -131,6 +148,23 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
+      - name: Ensure pinned SDL source exists
+        shell: bash
+        run: |
+          set -eu
+          SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
+          SDL_DIR=vendor/SDL
+          if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
+            rm -rf "$SDL_DIR"
+            mkdir -p vendor
+            git init "$SDL_DIR"
+            git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
+            git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
+            git -C "$SDL_DIR" checkout --detach FETCH_HEAD
+          fi
+          test -f "$SDL_DIR/CMakeLists.txt"
+          test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
+
       - name: Ensure OpenAL Soft source exists
         shell: bash
         run: |
@@ -215,6 +249,23 @@ jobs:
       run: |
         git submodule sync --recursive
         git submodule update --init --recursive
+
+    - name: Ensure pinned SDL source exists
+      shell: bash
+      run: |
+        set -eu
+        SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
+        SDL_DIR=vendor/SDL
+        if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
+          rm -rf "$SDL_DIR"
+          mkdir -p vendor
+          git init "$SDL_DIR"
+          git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
+          git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
+          git -C "$SDL_DIR" checkout --detach FETCH_HEAD
+        fi
+        test -f "$SDL_DIR/CMakeLists.txt"
+        test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
 
     - name: Ensure OpenAL Soft source exists
       shell: bash
@@ -344,6 +395,23 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
+      - name: Ensure pinned SDL source exists
+        shell: bash
+        run: |
+          set -eu
+          SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
+          SDL_DIR=vendor/SDL
+          if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
+            rm -rf "$SDL_DIR"
+            mkdir -p vendor
+            git init "$SDL_DIR"
+            git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
+            git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
+            git -C "$SDL_DIR" checkout --detach FETCH_HEAD
+          fi
+          test -f "$SDL_DIR/CMakeLists.txt"
+          test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
+
       - name: Ensure OpenAL Soft source exists
         shell: bash
         run: |
@@ -444,6 +512,23 @@ jobs:
       run: |
         git submodule sync --recursive
         git submodule update --init --recursive
+
+    - name: Ensure pinned SDL source exists
+      shell: bash
+      run: |
+        set -eu
+        SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
+        SDL_DIR=vendor/SDL
+        if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
+          rm -rf "$SDL_DIR"
+          mkdir -p vendor
+          git init "$SDL_DIR"
+          git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
+          git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
+          git -C "$SDL_DIR" checkout --detach FETCH_HEAD
+        fi
+        test -f "$SDL_DIR/CMakeLists.txt"
+        test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
 
     - name: Ensure OpenAL Soft source exists
       shell: bash
