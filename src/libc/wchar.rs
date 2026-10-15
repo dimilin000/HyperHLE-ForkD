@@ -6,7 +6,7 @@
 //! `wchar.h`
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, GuestUSize, MutPtr};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr};
 use crate::Environment;
 
 use super::generic_char::GenericChar;

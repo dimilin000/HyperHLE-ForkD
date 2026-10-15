@@ -34,8 +34,8 @@
 use crate::frameworks::core_graphics::CGFloat;
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
-    NSZonePtr,
+    autorelease, id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
+    HostObject, NSZonePtr,
 };
 
 #[derive(Default)]
