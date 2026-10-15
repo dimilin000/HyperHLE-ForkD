@@ -50,7 +50,7 @@ struct NSInvocationHostObject {
     /// Копии C-строк, созданные через `retainArguments`
     copied_strings: Vec<MutPtr<u8>>,
     /// Буфер возвращаемого значения (до 64 байт)
-    return_value: [u8; 64],
+    return_value: [u8; 32],
 }
 impl HostObject for NSInvocationHostObject {}
 
@@ -289,7 +289,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         arguments_retained: false,
         retained_objects: Vec::new(),
         copied_strings: Vec::new(),
-        return_value: [0u8; 64],
+        return_value: [0u8; 32],
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -321,7 +321,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         arguments_retained: false,
         retained_objects: Vec::new(),
         copied_strings: Vec::new(),
-        return_value: [0u8; 64],
+        return_value: [0u8; 32],
     });
     let res = env.objc.alloc_object(this, host_object, &mut env.mem);
     autorelease(env, res)
@@ -707,7 +707,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         4
     };
-    let copy_len = (len as usize).min(64);
+    let copy_len = (len as usize).min(32);
     if copy_len > 0 {
         let bytes = env.objc.borrow::<NSInvocationHostObject>(this).return_value;
         env.mem
@@ -726,9 +726,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         4
     };
-    let copy_len = (len as usize).min(64);
+    let copy_len = (len as usize).min(32);
     if copy_len > 0 {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 32];
         buf[..copy_len].copy_from_slice(env.mem.bytes_at(ret_loc.cast_const().cast(), copy_len as u32));
         env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value[..copy_len]
             .copy_from_slice(&buf[..copy_len]);

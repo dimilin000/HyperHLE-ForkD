@@ -253,11 +253,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         },
         kCATransactionCompletionBlock => {
             if let Some(transaction) = State::get_current_transaction_mut(env) {
-                let copied: id = if value != nil { msg![env; value copy] } else { nil };
-                let old = std::mem::replace(&mut transaction.completion_block, copied);
-                if old != nil {
-                    release(env, old);
-                }
+                let old_value = std::mem::replace(&mut transaction.completion_block, value);
+                retain(env, value);
+                release(env, old_value);
             }
         },
         _ => {

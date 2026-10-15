@@ -326,11 +326,11 @@ fn parse_objc_type(env: &mut Environment, mut ptr: ConstPtr<u8>) -> (ConstPtr<u8
 /// >= NSFoundationVersionNumber_iPhoneOS_4_0)`). We expose touchHLE's
 /// nominal "iOS 4.0" identity (build 8A293, see `libc/sys/utsname`) — the
 /// constant `751.32` is the documented Foundation version for iOS 4.0.
-fn effective_ios_major_minor(env: &Environment) -> (u32, u32) {
+fn effective_ios_major_minor(env: &Environment) -> (i32, i32) {
     if let Ok(val) = std::env::var("TOUCHHLE_IOS_VERSION") {
         let mut parts = val.split('.');
-        let major = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(7);
-        let minor = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+        let major = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(7);
+        let minor = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
         return (major, minor);
     }
     if let Some((major, minor, _)) = env.options.ios_version {
@@ -1666,7 +1666,7 @@ pub type NSUInteger = u32;
 // this should be equal to NSIntegerMax
 pub const NSNotFound: i32 = 0x7fffffff;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[repr(C, packed)]
 pub struct NSRange {
     pub location: NSUInteger,

@@ -12,7 +12,7 @@ pub mod ui_text_view;
 use crate::abi::{GuestArg, GuestRet};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
-use crate::mem::{SafeRead, SafeWrite};
+use crate::mem::SafeRead;
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, nil, objc_classes, ClassExports, NSZonePtr, SEL,
 };
@@ -63,7 +63,6 @@ struct UIEdgeInsets {
     right: CGFloat,
 }
 unsafe impl SafeRead for UIEdgeInsets {}
-unsafe impl SafeWrite for UIEdgeInsets {}
 crate::abi::impl_GuestRet_for_large_struct!(UIEdgeInsets);
 impl GuestArg for UIEdgeInsets {
     const REG_COUNT: usize = 4;

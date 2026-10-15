@@ -10,11 +10,11 @@ use crate::frameworks::core_foundation::time::{
     CFAbsoluteTimeGetGregorianDate, CFGregorianDate, CFGregorianDateGetAbsoluteTime,
 };
 use crate::frameworks::foundation::ns_date_components::NSDateComponentsHostObject;
-use crate::frameworks::foundation::ns_string::get_static_str;
+use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::Ptr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::Environment;
 

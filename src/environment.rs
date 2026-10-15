@@ -3978,7 +3978,7 @@ impl Environment {
                     .enumerate()
                     .find(|(_, t)| t.active && matches!(t.blocked_by, ThreadBlock::Condition(_, _) | ThreadBlock::Semaphore(_) | ThreadBlock::Mutex(_)))
                     .or_else(|| self.threads.iter().enumerate().find(|(_, t)| t.active))
-                    .map(|(tid, t)| (tid, t.blocked_by))
+                    .map(|(tid, t)| (tid, t.blocked_by.clone()))
                 {
                     log!(
                         "Warning: All threads blocked ({:?}); force-waking thread {} to prevent deadlock crash.",
