@@ -85,10 +85,19 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
     msg_class![env; NSMutableArray array]
 }
 
-// Per Apple docs: returns the cookies for a URL or `nil` if none. Since we
-// never deliver any cookies to the caller, `nil` is the documented answer.
+// Per Apple docs: `cookiesForURL:` returns `NSArray<NSHTTPCookie *> *` (an
+// empty array when no cookies match, never `nil`). Returning `nil` breaks
+// callers that do `[[storage cookiesForURL:url] count]` or fast-enumeration
+// expecting a non-nil array.
 - (id)cookiesForURL:(id)_url {
-    nil
+    msg_class![env; NSArray array]
+}
+
+- (())storeCookies:(id)cookies forTask:(id)_task {
+    let _: () = msg![env; this setCookies:cookies forURL:nil mainDocumentURL:nil];
+}
+
+- (())getCookiesForTask:(id)_task completionHandler:(id)_handler {
 }
 
 - (())setCookie:(id)cookie {
@@ -132,6 +141,57 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
     }
     env.objc.dealloc_object(this, &mut env.mem);
 }
+
+@end
+
+@implementation NSHTTPCookie: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+
++ (id)cookieWithProperties:(id)_properties {
+    let c: id = msg![env; this alloc];
+    let c: id = msg![env; c init];
+    crate::objc::autorelease(env, c)
+}
+
++ (id)cookiesWithResponseHeaderFields:(id)_header_fields forURL:(id)_url {
+    msg_class![env; NSArray array]
+}
+
++ (id)requestHeaderFieldsWithCookies:(id)_cookies {
+    msg_class![env; NSDictionary dictionary]
+}
+
+- (id)initWithProperties:(id)_properties {
+    this
+}
+
+- (id)properties {
+    msg_class![env; NSDictionary dictionary]
+}
+
+- (id)name {
+    crate::frameworks::foundation::ns_string::get_static_str(env, "")
+}
+
+- (id)value {
+    crate::frameworks::foundation::ns_string::get_static_str(env, "")
+}
+
+- (id)domain {
+    crate::frameworks::foundation::ns_string::get_static_str(env, "")
+}
+
+- (id)path {
+    crate::frameworks::foundation::ns_string::get_static_str(env, "/")
+}
+
+- (bool)isSecure { false }
+- (bool)isHTTPOnly { false }
+- (bool)isSessionOnly { true }
+- (id)expiresDate { nil }
 
 @end
 

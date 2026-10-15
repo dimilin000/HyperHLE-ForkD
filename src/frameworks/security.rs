@@ -63,38 +63,127 @@ pub const kSecTrustResultOtherError: SecTrustResultType = 7;
 // MARK: - SecItem (Keychain)
 // =========================================================================
 
+static KEYCHAIN_ITEMS: std::sync::Mutex<Vec<id>> = std::sync::Mutex::new(Vec::new());
+
+use crate::objc::{id, msg, msg_class, retain};
+
 fn SecItemCopyMatching(
     env: &mut Environment,
-    _query: CFDictionaryRef,
+    query: CFDictionaryRef,
     result: MutPtr<CFTypeRef>,
 ) -> OSStatus {
-    log_dbg!("SecItemCopyMatching — returning errSecItemNotFound");
     if !result.is_null() {
         env.mem.write(result, nil);
+    }
+    if query == nil {
+        return ERR_SEC_ITEM_NOT_FOUND;
+    }
+    let items: Vec<id> = KEYCHAIN_ITEMS.lock().unwrap().clone();
+    if items.is_empty() {
+        return ERR_SEC_ITEM_NOT_FOUND;
+    }
+    let acct_key = crate::frameworks::foundation::ns_string::get_static_str(env, "acct");
+    let svce_key = crate::frameworks::foundation::ns_string::get_static_str(env, "svce");
+    let v_data_key = crate::frameworks::foundation::ns_string::get_static_str(env, "v_Data");
+    let r_data_key = crate::frameworks::foundation::ns_string::get_static_str(env, "r_Data");
+    let query_acct: id = msg![env; query objectForKey:acct_key];
+    let query_svce: id = msg![env; query objectForKey:svce_key];
+    let return_data: id = msg![env; query objectForKey:r_data_key];
+    let wants_data: bool = if return_data != nil {
+        msg![env; return_data boolValue]
+    } else {
+        false
+    };
+    for &item in items.iter().rev() {
+        if query_acct != nil {
+            let item_acct: id = msg![env; item objectForKey:acct_key];
+            if item_acct != nil {
+                let eq: bool = msg![env; query_acct isEqual:item_acct];
+                if !eq {
+                    continue;
+                }
+            }
+        }
+        if query_svce != nil {
+            let item_svce: id = msg![env; item objectForKey:svce_key];
+            if item_svce != nil {
+                let eq: bool = msg![env; query_svce isEqual:item_svce];
+                if !eq {
+                    continue;
+                }
+            }
+        }
+        if !result.is_null() {
+            let out: id = if wants_data {
+                let d: id = msg![env; item objectForKey:v_data_key];
+                if d != nil { d } else { item }
+            } else {
+                item
+            };
+            retain(env, out);
+            env.mem.write(result, out);
+        }
+        return ERR_SEC_SUCCESS;
     }
     ERR_SEC_ITEM_NOT_FOUND
 }
 
 fn SecItemAdd(
-    _env: &mut Environment,
-    _attributes: CFDictionaryRef,
-    _result: MutPtr<CFTypeRef>,
+    env: &mut Environment,
+    attributes: CFDictionaryRef,
+    result: MutPtr<CFTypeRef>,
 ) -> OSStatus {
-    log_dbg!("SecItemAdd — returning errSecSuccess (stub)");
+    if !result.is_null() {
+        env.mem.write(result, nil);
+    }
+    if attributes != nil {
+        let copy: id = msg_class![env; NSMutableDictionary dictionaryWithDictionary:attributes];
+        retain(env, copy);
+        KEYCHAIN_ITEMS.lock().unwrap().push(copy);
+        if !result.is_null() {
+            let v_data_key = crate::frameworks::foundation::ns_string::get_static_str(env, "v_Data");
+            let r_data_key = crate::frameworks::foundation::ns_string::get_static_str(env, "r_Data");
+            let return_data: id = msg![env; attributes objectForKey:r_data_key];
+            let wants_data: bool = if return_data != nil {
+                msg![env; return_data boolValue]
+            } else {
+                false
+            };
+            let out: id = if wants_data {
+                let d: id = msg![env; copy objectForKey:v_data_key];
+                if d != nil { d } else { copy }
+            } else {
+                copy
+            };
+            retain(env, out);
+            env.mem.write(result, out);
+        }
+    }
     ERR_SEC_SUCCESS
 }
 
 fn SecItemDelete(_env: &mut Environment, _query: CFDictionaryRef) -> OSStatus {
-    log_dbg!("SecItemDelete — returning errSecItemNotFound");
-    ERR_SEC_ITEM_NOT_FOUND
+    let mut guard = KEYCHAIN_ITEMS.lock().unwrap();
+    if guard.is_empty() {
+        ERR_SEC_ITEM_NOT_FOUND
+    } else {
+        guard.clear();
+        ERR_SEC_SUCCESS
+    }
 }
 
 fn SecItemUpdate(
-    _env: &mut Environment,
+    env: &mut Environment,
     _query: CFDictionaryRef,
-    _attributes_to_update: CFDictionaryRef,
+    attributes_to_update: CFDictionaryRef,
 ) -> OSStatus {
-    log_dbg!("SecItemUpdate — returning errSecItemNotFound");
+    if attributes_to_update != nil {
+        let items: Vec<id> = KEYCHAIN_ITEMS.lock().unwrap().clone();
+        if let Some(&last) = items.last() {
+            let _: () = msg![env; last addEntriesFromDictionary:attributes_to_update];
+            return ERR_SEC_SUCCESS;
+        }
+    }
     ERR_SEC_ITEM_NOT_FOUND
 }
 

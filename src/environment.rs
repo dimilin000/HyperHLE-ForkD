@@ -570,8 +570,27 @@ impl Environment {
         // Default model picked for each class when the user hasn't chosen one.
         // iPhone 3GS (iPhone2,1) is the historical touchHLE phone default
         // (320x480, GLES2-capable); iPad 2 (iPad2,1) is the tablet default.
-        let default_phone = DeviceFamily::iPhone3GS;
-        let default_ipad = DeviceFamily::iPad2;
+        let min_os_major: u32 = bundle
+            .minimum_os_version()
+            .as_deref()
+            .and_then(|v| v.split('.').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let prefers_modern_hardware = min_os_major >= 7
+            || matches!(
+                bundle.bundle_identifier(),
+                "com.mojang.minecraftpe"
+            );
+        let default_phone = if prefers_modern_hardware {
+            DeviceFamily::iPhone5
+        } else {
+            DeviceFamily::iPhone3GS
+        };
+        let default_ipad = if prefers_modern_hardware {
+            DeviceFamily::iPad4
+        } else {
+            DeviceFamily::iPad2
+        };
 
         let device_family = if let Some(dfo) = device_family_override {
             let override_is_ipad = dfo.is_ipad();
@@ -703,10 +722,34 @@ impl Environment {
         .map_err(|e| format!("Could not load executable: {e}"))?;
         drop(executable_bytes);
 
+        let mut next_custom_dylib_slide: u32 = 0x39000000;
         let dylibs = load_transitive_dependencies(&executable.dynamic_libraries, |dylib| {
-            let dylib_path = fs::GuestPath::new(dylib);
-            if fs.is_file(dylib_path) {
-                assert!(dylib_path.as_str().starts_with("/usr/lib/"));
+            let implemented_in_host = crate::dyld::DYLIB_LIST
+                .iter()
+                .any(|d| d.path == dylib || d.aliases.contains(&dylib));
+            let resolved_guest_path: Option<fs::GuestPathBuf> = if implemented_in_host {
+                None
+            } else if fs.is_file(fs::GuestPath::new(dylib)) {
+                Some(fs::GuestPathBuf::from(dylib.to_string()))
+            } else if let Some(rel) = dylib
+                .strip_prefix("@rpath/")
+                .or_else(|| dylib.strip_prefix("@executable_path/"))
+                .or_else(|| dylib.strip_prefix("@loader_path/"))
+            {
+                let c1 = bundle.bundle_path().join("Frameworks").join(rel);
+                let c2 = bundle.bundle_path().join(rel);
+                if fs.is_file(&c1) {
+                    Some(c1)
+                } else if fs.is_file(&c2) {
+                    Some(c2)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(ref dylib_path) = resolved_guest_path {
+                let dylib_path = dylib_path.as_ref();
                 let name = dylib_path.file_name().unwrap();
                 let dylib_slide = match name {
                     "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => 0x3748a000,
@@ -717,15 +760,18 @@ impl Environment {
                     "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => 0,
                     "libsqlite3.dylib" | "libsqlite3.0.dylib" => 0,
                     _ => {
+                        let slide = next_custom_dylib_slide;
+                        next_custom_dylib_slide = next_custom_dylib_slide.wrapping_add(0x01000000);
                         log!(
-                            "Warning: unknown binary slide for {:?}; loading at slide 0. App may fail to bind some symbols.",
-                            name
+                            "Loading embedded dylib {:?} at slide {:#x}",
+                            name,
+                            slide
                         );
-                        0
+                        slide
                     }
                 };
                 let binary = mach_o::MachO::load_from_file(
-                    fs::GuestPath::new(dylib),
+                    dylib_path,
                     &fs,
                     &mut mem,
                     dylib_slide,

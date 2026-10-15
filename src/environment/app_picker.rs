@@ -63,8 +63,242 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
+const PICKER_SETTINGS_FILE: &str = "hyperhle_picker_settings.cfg";
+
+#[derive(Clone, Debug)]
+struct PersistedPickerSettings {
+    scale_hack: Option<NonZeroU32>,
+    orientation: Option<DeviceOrientation>,
+    fullscreen: bool,
+    gles_native: Option<bool>,
+    force_composition: Option<bool>,
+    show_fps: bool,
+    trace_gl_errors: bool,
+    device_tag: Option<i32>,
+    ios_version_tag: Option<i32>,
+    language_tag: Option<i32>,
+    cheat_engine: Option<bool>,
+    network: bool,
+    analog_stick_tilt_controls: bool,
+}
+
+impl Default for PersistedPickerSettings {
+    fn default() -> Self {
+        Self {
+            scale_hack: None,
+            orientation: None,
+            fullscreen: false,
+            gles_native: None,
+            force_composition: None,
+            show_fps: false,
+            trace_gl_errors: false,
+            device_tag: None,
+            ios_version_tag: None,
+            language_tag: None,
+            cheat_engine: None,
+            network: false,
+            analog_stick_tilt_controls: true,
+        }
+    }
+}
+
+fn picker_settings_path() -> PathBuf {
+    paths::user_data_base_path().join(PICKER_SETTINGS_FILE)
+}
+
+fn load_picker_settings() -> PersistedPickerSettings {
+    let mut s = PersistedPickerSettings::default();
+    let path = picker_settings_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return s;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        match key {
+            "scale_hack" => {
+                s.scale_hack = val.parse::<u32>().ok().and_then(NonZeroU32::new);
+            }
+            "orientation" => {
+                s.orientation = match val {
+                    "landscape_left" => Some(DeviceOrientation::LandscapeLeft),
+                    "landscape_right" => Some(DeviceOrientation::LandscapeRight),
+                    "portrait_upside_down" => Some(DeviceOrientation::PortraitUpsideDown),
+                    "portrait" => Some(DeviceOrientation::Portrait),
+                    _ => None,
+                };
+            }
+            "fullscreen" => s.fullscreen = val == "true" || val == "1",
+            "gles_native" => {
+                s.gles_native = match val {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                };
+            }
+            "force_composition" => {
+                s.force_composition = match val {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                };
+            }
+            "show_fps" => s.show_fps = val == "true" || val == "1",
+            "trace_gl_errors" => s.trace_gl_errors = val == "true" || val == "1",
+            "device_tag" => s.device_tag = val.parse::<i32>().ok(),
+            "ios_version_tag" => s.ios_version_tag = val.parse::<i32>().ok(),
+            "language_tag" => s.language_tag = val.parse::<i32>().ok(),
+            "cheat_engine" => {
+                s.cheat_engine = match val {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                };
+            }
+            "network" => s.network = val == "true" || val == "1",
+            "analog_stick_tilt_controls" => {
+                s.analog_stick_tilt_controls = !(val == "false" || val == "0");
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+fn save_picker_settings(s: &PersistedPickerSettings) {
+    let scale_str = s.scale_hack.map_or("default".to_string(), |n| n.get().to_string());
+    let orient_str = match s.orientation {
+        Some(DeviceOrientation::LandscapeLeft) => "landscape_left",
+        Some(DeviceOrientation::LandscapeRight) => "landscape_right",
+        Some(DeviceOrientation::PortraitUpsideDown) => "portrait_upside_down",
+        Some(DeviceOrientation::Portrait) => "portrait",
+        None => "default",
+    };
+    let gles_str = match s.gles_native {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "default",
+    };
+    let comp_str = match s.force_composition {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "default",
+    };
+    let ce_str = match s.cheat_engine {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "default",
+    };
+    let dev_str = s.device_tag.map_or("default".to_string(), |t| t.to_string());
+    let ios_str = s.ios_version_tag.map_or("default".to_string(), |t| t.to_string());
+    let lang_str = s.language_tag.map_or("default".to_string(), |t| t.to_string());
+
+    let content = format!(
+        "# HyperHLE-Fork Persistent Settings
+         scale_hack={scale_str}
+         orientation={orient_str}
+         fullscreen={}
+         gles_native={gles_str}
+         force_composition={comp_str}
+         show_fps={}
+         trace_gl_errors={}
+         device_tag={dev_str}
+         ios_version_tag={ios_str}
+         language_tag={lang_str}
+         cheat_engine={ce_str}
+         network={}
+         analog_stick_tilt_controls={}
+",
+        s.fullscreen,
+        s.show_fps,
+        s.trace_gl_errors,
+        s.network,
+        s.analog_stick_tilt_controls,
+    );
+    let path = picker_settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, content) {
+        log!("Warning: couldn't save picker settings to {}: {}", path.display(), e);
+    }
+}
+
+/// Returns CLI option arguments corresponding to the user's saved Settings from
+/// `hyperhle_picker_settings.cfg`, used when an app is launched directly from
+/// the command line or file association without opening the picker UI.
+pub fn persisted_picker_option_args() -> Vec<String> {
+    let persisted = load_picker_settings();
+    let mut args = Vec::new();
+    if let Some(scale_hack) = persisted.scale_hack {
+        args.push(format!("--scale-hack={}", scale_hack.get()));
+    }
+    if let Some(orientation) = persisted.orientation {
+        args.push(
+            match orientation {
+                DeviceOrientation::LandscapeLeft => "--landscape-left",
+                DeviceOrientation::LandscapeRight => "--landscape-right",
+                DeviceOrientation::PortraitUpsideDown => "--upside-down",
+                DeviceOrientation::Portrait => "--portrait",
+            }
+            .to_string(),
+        );
+    }
+    if persisted.fullscreen {
+        args.push("--fullscreen".to_string());
+    }
+    if !persisted.analog_stick_tilt_controls {
+        args.push("--disable-analog-stick-tilt-controls".to_string());
+    }
+    if persisted.network {
+        args.push("--allow-network-access".to_string());
+    }
+    if let Some(ce) = persisted.cheat_engine {
+        args.push(quick_options_trainer_argument(ce).to_string());
+    }
+    if persisted.show_fps {
+        args.push("--print-fps".to_string());
+    }
+    if let Some(comp) = persisted.force_composition {
+        args.push(quick_options_force_composition_argument(comp).to_string());
+    }
+    if persisted.trace_gl_errors {
+        args.push("--trace-gl-errors".to_string());
+    }
+    if let Some(gles_native) = persisted.gles_native {
+        args.push(quick_options_gles_native_argument(gles_native).to_string());
+    }
+    if let Some(tag) = persisted.device_tag {
+        let tag = tag as NSInteger;
+        if tag == DEVICE_TAG_AUTO {
+            args.push("--device-family=auto".to_string());
+        } else if tag != DEVICE_TAG_DEFAULT {
+            if let Some(family) = crate::window::DeviceFamily::ALL_SELECTABLE.get(tag as usize) {
+                args.push(format!("--device-family={}", family.option_name()));
+            }
+        }
+    }
+    if let Some(arg) = ios_version_argument(persisted.ios_version_tag) {
+        args.push(arg);
+    }
+    if let Some(arg) = language_argument(persisted.language_tag) {
+        args.push(arg);
+    }
+    args
+}
+
 pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
+    if !apps_dir.exists() {
+        let _ = std::fs::create_dir_all(&apps_dir);
+    }
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
         Err(format!("The {} directory couldn't be found. Check you're running touchHLE from the right directory.", apps_dir.display()))
@@ -291,6 +525,10 @@ struct AppPickerDelegateHostObject {
     device_model_toggle: bool,
     device_model_scroll_up: bool,
     device_model_scroll_down: bool,
+    ios_version_tag: Option<i32>,
+    ios_version_toggle: bool,
+    ios_version_scroll_up: bool,
+    ios_version_scroll_down: bool,
     language_tag: Option<i32>,
     language_toggle: bool,
     language_scroll_up: bool,
@@ -422,6 +660,19 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())deviceModelScrollDown {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_down = true;
+}
+- (())iosVersion:(id)sender { // UIButton*
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_tag = Some(tag as i32);
+}
+- (())iosVersionToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_toggle = true;
+}
+- (())iosVersionScrollUp {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_scroll_up = true;
+}
+- (())iosVersionScrollDown {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_scroll_down = true;
 }
 - (())language:(id)sender { // UIButton*
     let tag: NSInteger = msg![env; sender tag];
@@ -687,11 +938,48 @@ fn app_picker_inner(
         }
     };
 
-    let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
+    let mut persisted = load_picker_settings();
+    let mut quick_options_cheat_engine = persisted
+        .cheat_engine
+        .unwrap_or_else(|| quick_options_trainer_enabled(&env.options));
     let angle_backend_available = crate::window::angle_backend_available();
-    let (mut quick_options_gles_native, quick_options_gles_native_switch_enabled) =
+    let (default_gles_native, quick_options_gles_native_switch_enabled) =
         quick_options_gles_native_state(&env.options, angle_backend_available);
-    let quick_options_force_composition_enabled = env.options.force_composition;
+    let mut quick_options_gles_native = persisted
+        .gles_native
+        .map(|v| v || !angle_backend_available)
+        .unwrap_or(default_gles_native);
+    let quick_options_force_composition_enabled = persisted
+        .force_composition
+        .unwrap_or(env.options.force_composition);
+    let mut quick_options_scale_hack: Option<NonZeroU32> = persisted.scale_hack;
+    let mut quick_options_fullscreen: Option<()> = if persisted.fullscreen { Some(()) } else { None };
+    let mut quick_options_orientation: Option<DeviceOrientation> = persisted.orientation;
+    let mut quick_options_analog_stick_tilt_controls = persisted.analog_stick_tilt_controls;
+    let mut quick_options_network = persisted.network;
+    let mut quick_options_show_fps = persisted.show_fps;
+    let mut quick_options_trace_gl_errors = persisted.trace_gl_errors;
+    let mut quick_options_force_composition_override: Option<bool> = persisted.force_composition;
+    if quick_options_show_fps {
+        std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
+        crate::gles::present::set_onscreen_fps_enabled(true);
+    }
+    let mut device_state = DropdownState {
+        selected: persisted.device_tag,
+        open: false,
+        scroll: 0,
+    };
+    let mut ios_version_state = DropdownState {
+        selected: persisted.ios_version_tag,
+        open: false,
+        scroll: 0,
+    };
+    let mut language_state = DropdownState {
+        selected: persisted.language_tag,
+        open: false,
+        scroll: 0,
+    };
+
     let settings = setup_settings(
         env,
         delegate,
@@ -702,17 +990,12 @@ fn app_picker_inner(
         quick_options_gles_native_switch_enabled,
         quick_options_force_composition_enabled,
         !crate::window::Window::rotatable_fullscreen(),
+        persisted.fullscreen,
+        quick_options_show_fps,
+        quick_options_trace_gl_errors,
+        quick_options_network,
+        quick_options_analog_stick_tilt_controls,
     );
-    let mut quick_options_scale_hack: Option<NonZeroU32> = None;
-    let mut quick_options_fullscreen: Option<()> = None;
-    let mut quick_options_orientation: Option<DeviceOrientation> = None;
-    let mut quick_options_analog_stick_tilt_controls = true;
-    let mut quick_options_network = false;
-    let mut quick_options_show_fps = false;
-    let mut quick_options_trace_gl_errors = false;
-    let mut quick_options_force_composition_override: Option<bool> = None;
-    let mut device_state = DropdownState::default();
-    let mut language_state = DropdownState::default();
 
     update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
     update_orientation_buttons(env, &settings.orientation_buttons, quick_options_orientation);
@@ -721,6 +1004,12 @@ fn app_picker_inner(
         &settings.device_dropdown,
         &device_model_label_for_tag(device_state.selected),
         &device_state,
+    );
+    refresh_dropdown(
+        env,
+        &settings.ios_version_dropdown,
+        &ios_version_label_for_tag(ios_version_state.selected),
+        &ios_version_state,
     );
     refresh_dropdown(
         env,
@@ -927,21 +1216,33 @@ fn app_picker_inner(
             );
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
             quick_options_scale_hack = None;
+            persisted.scale_hack = None;
+            save_picker_settings(&persisted);
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
         } else if std::mem::take(&mut host_obj.scale_hack1) {
             quick_options_scale_hack = NonZeroU32::new(1);
+            persisted.scale_hack = quick_options_scale_hack;
+            save_picker_settings(&persisted);
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
         } else if std::mem::take(&mut host_obj.scale_hack2) {
             quick_options_scale_hack = NonZeroU32::new(2);
+            persisted.scale_hack = quick_options_scale_hack;
+            save_picker_settings(&persisted);
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
         } else if std::mem::take(&mut host_obj.scale_hack3) {
             quick_options_scale_hack = NonZeroU32::new(3);
+            persisted.scale_hack = quick_options_scale_hack;
+            save_picker_settings(&persisted);
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
         } else if std::mem::take(&mut host_obj.scale_hack4) {
             quick_options_scale_hack = NonZeroU32::new(4);
+            persisted.scale_hack = quick_options_scale_hack;
+            save_picker_settings(&persisted);
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
         } else if std::mem::take(&mut host_obj.orientation_default) {
             quick_options_orientation = None;
+            persisted.orientation = None;
+            save_picker_settings(&persisted);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
@@ -949,6 +1250,8 @@ fn app_picker_inner(
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_left) {
             quick_options_orientation = Some(DeviceOrientation::LandscapeLeft);
+            persisted.orientation = quick_options_orientation;
+            save_picker_settings(&persisted);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
@@ -956,6 +1259,8 @@ fn app_picker_inner(
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_right) {
             quick_options_orientation = Some(DeviceOrientation::LandscapeRight);
+            persisted.orientation = quick_options_orientation;
+            save_picker_settings(&persisted);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
@@ -963,6 +1268,8 @@ fn app_picker_inner(
             );
         } else if std::mem::take(&mut host_obj.orientation_portrait_upside_down) {
             quick_options_orientation = Some(DeviceOrientation::PortraitUpsideDown);
+            persisted.orientation = quick_options_orientation;
+            save_picker_settings(&persisted);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
@@ -971,6 +1278,8 @@ fn app_picker_inner(
         } else if let Some(tag) = std::mem::take(&mut host_obj.device_model_tag) {
             device_state.selected = Some(tag);
             device_state.open = false;
+            persisted.device_tag = Some(tag);
+            save_picker_settings(&persisted);
             refresh_dropdown(
                 env,
                 &settings.device_dropdown,
@@ -1002,9 +1311,47 @@ fn app_picker_inner(
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
             );
+        } else if let Some(tag) = std::mem::take(&mut host_obj.ios_version_tag) {
+            ios_version_state.selected = Some(tag);
+            ios_version_state.open = false;
+            persisted.ios_version_tag = Some(tag);
+            save_picker_settings(&persisted);
+            refresh_dropdown(
+                env,
+                &settings.ios_version_dropdown,
+                &ios_version_label_for_tag(ios_version_state.selected),
+                &ios_version_state,
+            );
+        } else if std::mem::take(&mut host_obj.ios_version_toggle) {
+            ios_version_state.open = !ios_version_state.open;
+            refresh_dropdown(
+                env,
+                &settings.ios_version_dropdown,
+                &ios_version_label_for_tag(ios_version_state.selected),
+                &ios_version_state,
+            );
+        } else if std::mem::take(&mut host_obj.ios_version_scroll_up) {
+            ios_version_state.scroll = (ios_version_state.scroll - 1).max(0);
+            refresh_dropdown(
+                env,
+                &settings.ios_version_dropdown,
+                &ios_version_label_for_tag(ios_version_state.selected),
+                &ios_version_state,
+            );
+        } else if std::mem::take(&mut host_obj.ios_version_scroll_down) {
+            ios_version_state.scroll = (ios_version_state.scroll + 1)
+                .min(dropdown_max_scroll(settings.ios_version_dropdown.items.len()));
+            refresh_dropdown(
+                env,
+                &settings.ios_version_dropdown,
+                &ios_version_label_for_tag(ios_version_state.selected),
+                &ios_version_state,
+            );
         } else if let Some(tag) = std::mem::take(&mut host_obj.language_tag) {
             language_state.selected = Some(tag);
             language_state.open = false;
+            persisted.language_tag = Some(tag);
+            save_picker_settings(&persisted);
             refresh_dropdown(
                 env,
                 &settings.language_dropdown,
@@ -1057,23 +1404,39 @@ fn app_picker_inner(
             }
         } else if let Some(enabled) = std::mem::take(&mut host_obj.analog_stick_tilt_controls) {
             quick_options_analog_stick_tilt_controls = enabled;
+            persisted.analog_stick_tilt_controls = enabled;
+            save_picker_settings(&persisted);
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
             quick_options_network = enabled;
+            persisted.network = enabled;
+            save_picker_settings(&persisted);
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
             quick_options_cheat_engine = enabled;
+            persisted.cheat_engine = Some(enabled);
+            save_picker_settings(&persisted);
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
+            persisted.show_fps = enabled;
+            save_picker_settings(&persisted);
         } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
             quick_options_trace_gl_errors = trace_gl_errors;
+            persisted.trace_gl_errors = trace_gl_errors;
+            save_picker_settings(&persisted);
         } else if let Some(force_composition) = std::mem::take(&mut host_obj.force_composition) {
             quick_options_force_composition_override = Some(force_composition);
+            persisted.force_composition = Some(force_composition);
+            save_picker_settings(&persisted);
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
             quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
+            persisted.gles_native = Some(gles_native);
+            save_picker_settings(&persisted);
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
                 true => Some(()),
             };
+            persisted.fullscreen = fullscreen;
+            save_picker_settings(&persisted);
         }
 
         // Detect .ipa files copied in by the "+" tile flow and refresh the
@@ -1157,9 +1520,15 @@ fn app_picker_inner(
         }
     }
 
+    if let Some(arg) = ios_version_argument(ios_version_state.selected) {
+        option_args.push(arg);
+    }
+
     if let Some(arg) = language_argument(language_state.selected) {
         option_args.push(arg);
     }
+
+    save_picker_settings(&persisted);
 
     // Return the environment so some parts of it can be salvaged.
     (app_path, option_args)
@@ -2145,6 +2514,8 @@ enum SettingsRow {
     Segmented(&'static str, &'static [(&'static str, &'static str)]),
     /// The "Device model" row (its dropdown is a root-level overlay).
     DeviceDropdown,
+    /// The "iOS version" row (its dropdown is a root-level overlay).
+    IosVersionDropdown,
     /// The "Language" row (its dropdown is a root-level overlay).
     LanguageDropdown,
     /// Label and switch: (label, selector, initial state, enabled).
@@ -2177,6 +2548,8 @@ struct SettingsStuff {
     orientation_buttons: [id; 4],
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
+    /// The "iOS version" dropdown.
+    ios_version_dropdown: SettingsDropdown,
     /// The "Language" dropdown.
     language_dropdown: SettingsDropdown,
 }
@@ -2252,6 +2625,7 @@ fn dropdown_max_scroll(item_count: usize) -> isize {
 
 /// Builds the Settings screen: a navigation bar with a "Done" button, and a
 /// scrollable list of grouped sections in the style of the iOS Settings app.
+#[allow(clippy::too_many_arguments)]
 fn setup_settings(
     env: &mut Environment,
     delegate: id,
@@ -2262,6 +2636,11 @@ fn setup_settings(
     gles_native_switch_enabled: bool,
     force_composition_enabled: bool,
     show_fullscreen_row: bool,
+    fullscreen_enabled: bool,
+    show_fps_enabled: bool,
+    trace_gl_errors_enabled: bool,
+    network_enabled: bool,
+    analog_stick_tilt_enabled: bool,
 ) -> SettingsStuff {
     let width = app_frame.size.width;
     let height = app_frame.size.height;
@@ -2374,7 +2753,7 @@ fn setup_settings(
         display_rows.push(SettingsRow::Toggle(
             "Fullscreen (override)",
             "fullscreen:",
-            false,
+            fullscreen_enabled,
             true,
         ));
     }
@@ -2394,14 +2773,15 @@ fn setup_settings(
                 force_composition_enabled,
                 true,
             ),
-            SettingsRow::Toggle("Show FPS", "showFPS:", false, true),
-            SettingsRow::Toggle("Trace GL errors", "traceGLErrors:", false, true),
+            SettingsRow::Toggle("Show FPS", "showFPS:", show_fps_enabled, true),
+            SettingsRow::Toggle("Trace GL errors", "traceGLErrors:", trace_gl_errors_enabled, true),
         ],
     ));
     sections.push((
         "DEVICE",
         vec![
             SettingsRow::DeviceDropdown,
+            SettingsRow::IosVersionDropdown,
             SettingsRow::LanguageDropdown,
         ],
     ));
@@ -2409,11 +2789,11 @@ fn setup_settings(
         "EMULATION",
         vec![
             SettingsRow::Toggle("Cheat Engine", "cheatEngine:", cheat_engine_enabled, true),
-            SettingsRow::Toggle("Network access", "network:", false, true),
+            SettingsRow::Toggle("Network access", "network:", network_enabled, true),
             SettingsRow::Toggle(
                 "Use analog sticks for tilt controls",
                 "analogStickTiltControls:",
-                true,
+                analog_stick_tilt_enabled,
                 true,
             ),
         ],
@@ -2424,6 +2804,7 @@ fn setup_settings(
     let mut scale_hack_buttons: Vec<id> = Vec::new();
     let mut orientation_buttons: Vec<id> = Vec::new();
     let mut device_dropdown: Option<SettingsDropdown> = None;
+    let mut ios_version_dropdown: Option<SettingsDropdown> = None;
     let mut language_dropdown: Option<SettingsDropdown> = None;
     // Where the lists of both dropdowns open: just under the navigation bar.
     let menu_origin = CGPoint {
@@ -2499,6 +2880,26 @@ fn setup_settings(
                         rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
                         menu_origin,
                         device_model_dropdown_spec(),
+                    ));
+                }
+                SettingsRow::IosVersionDropdown => {
+                    let label_view = new_label(
+                        env,
+                        rect(side, row_y + 11.0, 150.0, 22.0),
+                        "iOS version",
+                        16.0,
+                        false,
+                        black,
+                    );
+                    () = msg![env; group addSubview:label_view];
+                    ios_version_dropdown = Some(make_settings_dropdown(
+                        env,
+                        delegate,
+                        group,
+                        settings_view,
+                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
+                        menu_origin,
+                        ios_version_dropdown_spec(),
                     ));
                 }
                 SettingsRow::LanguageDropdown => {
@@ -2593,6 +2994,8 @@ fn setup_settings(
         orientation_buttons: orientation_buttons.try_into().unwrap(),
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
+        ios_version_dropdown: ios_version_dropdown
+            .expect("the settings screen always has an iOS version row"),
         language_dropdown: language_dropdown
             .expect("the settings screen always has a language row"),
     }
@@ -2605,24 +3008,90 @@ const DEVICE_TAG_DEFAULT: NSInteger = 1000;
 const DEVICE_TAG_AUTO: NSInteger = 1001;
 
 /// How many rows of the device-model dropdown are visible at once before the
-/// list has to be scrolled.
-const DEVICE_MENU_VISIBLE_ITEMS: usize = 6;
+/// list has to be scrolled. Increased to 9 so iPhone 5 and iPhone 5c are
+/// immediately visible without scrolling.
+const DEVICE_MENU_VISIBLE_ITEMS: usize = 9;
 /// Height of a single row in the device-model dropdown.
-const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
+const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 27.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
-/// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
-/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order
-/// tagged with its index.
+/// `(title, tag)` pairs: "Default", "Auto", then iPhone 5 & iPhone 5c at the
+/// top (for iOS 7–10 games), followed by all other [crate::window::DeviceFamily]
+/// models tagged with their index in `DeviceFamily::ALL_SELECTABLE`.
 fn device_model_entries() -> Vec<(String, NSInteger)> {
     use crate::window::DeviceFamily;
     let mut entries: Vec<(String, NSInteger)> = Vec::new();
     entries.push(("Default".to_string(), DEVICE_TAG_DEFAULT));
     entries.push(("Auto".to_string(), DEVICE_TAG_AUTO));
-    for (idx, family) in DeviceFamily::ALL_SELECTABLE.iter().enumerate() {
-        entries.push((family.display_name().to_string(), idx as NSInteger));
+
+    let priority_order = [
+        DeviceFamily::iPhone5,
+        DeviceFamily::iPhone5c,
+        DeviceFamily::iPhone4s,
+        DeviceFamily::iPhone4,
+        DeviceFamily::iPhone3GS,
+        DeviceFamily::iPhone3G,
+        DeviceFamily::iPhone,
+        DeviceFamily::iPad4,
+        DeviceFamily::iPad3,
+        DeviceFamily::iPad2,
+        DeviceFamily::iPad,
+        DeviceFamily::iPad5,
+        DeviceFamily::iPadMini2,
+        DeviceFamily::iPadMini3,
+        DeviceFamily::iPadMini,
+        DeviceFamily::iPodTouch5,
+        DeviceFamily::iPodTouch4,
+        DeviceFamily::iPodTouch3,
+        DeviceFamily::iPodTouch2,
+        DeviceFamily::iPodTouch,
+    ];
+    for model in priority_order {
+        if let Some(idx) = DeviceFamily::ALL_SELECTABLE.iter().position(|&f| f == model) {
+            entries.push((model.display_name().to_string(), idx as NSInteger));
+        }
     }
     entries
+}
+
+const IOS_VERSION_CHOICES: &[(&str, Option<&str>)] = &[
+    ("Auto (10.3.3)", None),
+    ("iOS 10.3.3", Some("10.3.3")),
+    ("iOS 9.3.5", Some("9.3.5")),
+    ("iOS 8.4.1", Some("8.4.1")),
+    ("iOS 7.1.2", Some("7.1.2")),
+    ("iOS 6.1.6", Some("6.1.6")),
+    ("iOS 5.1.1", Some("5.1.1")),
+    ("iOS 4.3.5", Some("4.3.5")),
+    ("iOS 3.1.3", Some("3.1.3")),
+];
+
+fn ios_version_dropdown_spec() -> DropdownSpec {
+    DropdownSpec {
+        entries: IOS_VERSION_CHOICES
+            .iter()
+            .enumerate()
+            .map(|(idx, (title, _))| (title.to_string(), idx as NSInteger))
+            .collect(),
+        toggle_selector: "iosVersionToggle",
+        item_selector: "iosVersion:",
+        scroll_up_selector: "iosVersionScrollUp",
+        scroll_down_selector: "iosVersionScrollDown",
+    }
+}
+
+fn ios_version_label_for_tag(tag: Option<i32>) -> String {
+    let idx = tag.unwrap_or(0) as usize;
+    IOS_VERSION_CHOICES
+        .get(idx)
+        .map_or("Auto (10.3.3)", |choice| choice.0)
+        .to_string()
+}
+
+fn ios_version_argument(tag: Option<i32>) -> Option<String> {
+    let idx = tag?;
+    let &(_, ver) = IOS_VERSION_CHOICES.get(idx as usize)?;
+    ver.map(|v| format!("--ios-version={v}"))
 }
 
 /// The spec of the "Device model" dropdown.
@@ -2920,6 +3389,9 @@ fn make_settings_dropdown(
     };
     () = msg![env; up_btn setFrame:up_frame];
     () = msg![env; up_btn setBackgroundColor:clear];
+    let up_title = ns_string::get_static_str(env, "▲");
+    () = msg![env; up_btn setTitle:up_title forState:UIControlStateNormal];
+    () = msg![env; up_btn setTitleColor:white forState:UIControlStateNormal];
     () = msg![env; up_btn addTarget:delegate
                              action:(env.objc.lookup_selector(scroll_up_selector).unwrap())
                    forControlEvents:UIControlEventTouchUpInside];
@@ -2938,6 +3410,9 @@ fn make_settings_dropdown(
     };
     () = msg![env; down_btn setFrame:down_frame];
     () = msg![env; down_btn setBackgroundColor:clear];
+    let down_title = ns_string::get_static_str(env, "▼");
+    () = msg![env; down_btn setTitle:down_title forState:UIControlStateNormal];
+    () = msg![env; down_btn setTitleColor:white forState:UIControlStateNormal];
     () = msg![env; down_btn addTarget:delegate
                                action:(env.objc.lookup_selector(scroll_down_selector).unwrap())
                      forControlEvents:UIControlEventTouchUpInside];

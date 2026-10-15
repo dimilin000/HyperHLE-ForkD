@@ -707,6 +707,305 @@ fn mbsrtowcs_l(
     mbsrtowcs(env, dest, src, len, ps)
 }
 
+fn btowc_l(env: &mut Environment, c: i32, _loc: crate::libc::clocale::locale_t) -> wint_t {
+    btowc(env, c)
+}
+
+fn wctob_l(env: &mut Environment, c: wint_t, _loc: crate::libc::clocale::locale_t) -> i32 {
+    wctob(env, c)
+}
+
+fn mbrtowc(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    _ps: crate::mem::MutVoidPtr,
+) -> GuestUSize {
+    if s.is_null() {
+        return 0;
+    }
+    if n == 0 {
+        return (-2i32) as GuestUSize;
+    }
+    let byte = env.mem.read(s);
+    if !pwc.is_null() {
+        env.mem.write(pwc, byte as wchar_t);
+    }
+    if byte == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+fn mbrtowc_l(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: crate::mem::MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    mbrtowc(env, pwc, s, n, ps)
+}
+
+fn wcrtomb(
+    env: &mut Environment,
+    s: MutPtr<u8>,
+    wc: wchar_t,
+    _ps: crate::mem::MutVoidPtr,
+) -> GuestUSize {
+    if s.is_null() {
+        return 1;
+    }
+    env.mem.write(s, (wc & 0xFF) as u8);
+    1
+}
+
+fn wcrtomb_l(
+    env: &mut Environment,
+    s: MutPtr<u8>,
+    wc: wchar_t,
+    ps: crate::mem::MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    wcrtomb(env, s, wc, ps)
+}
+
+fn mbrlen(
+    env: &mut Environment,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: crate::mem::MutVoidPtr,
+) -> GuestUSize {
+    mbrtowc(env, Ptr::null(), s, n, ps)
+}
+
+fn mbrlen_l(
+    env: &mut Environment,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: crate::mem::MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    mbrlen(env, s, n, ps)
+}
+
+fn mbsnrtowcs(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: MutPtr<ConstPtr<u8>>,
+    nms: GuestUSize,
+    len: GuestUSize,
+    _ps: crate::mem::MutVoidPtr,
+) -> GuestUSize {
+    if src.is_null() {
+        return 0;
+    }
+    let src_ptr: ConstPtr<u8> = env.mem.read(src);
+    if src_ptr.is_null() {
+        return 0;
+    }
+    let max_count = if dest.is_null() { nms } else { nms.min(len) };
+    let mut i: GuestUSize = 0;
+    while i < max_count {
+        let byte = env.mem.read(src_ptr + i);
+        if !dest.is_null() {
+            env.mem.write(dest + i, byte as wchar_t);
+        }
+        if byte == 0 {
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
+        }
+        i += 1;
+    }
+    if !dest.is_null() {
+        env.mem.write(src, src_ptr + i);
+    }
+    i
+}
+
+fn mbsnrtowcs_l(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: MutPtr<ConstPtr<u8>>,
+    nms: GuestUSize,
+    len: GuestUSize,
+    ps: crate::mem::MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    mbsnrtowcs(env, dest, src, nms, len, ps)
+}
+
+fn wcsrtombs(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    len: GuestUSize,
+    _ps: crate::mem::MutVoidPtr,
+) -> GuestUSize {
+    if src.is_null() {
+        return 0;
+    }
+    let src_ptr: ConstPtr<wchar_t> = env.mem.read(src);
+    if src_ptr.is_null() {
+        return 0;
+    }
+    let mut i: GuestUSize = 0;
+    loop {
+        if !dest.is_null() && i == len {
+            break;
+        }
+        let wc = env.mem.read(src_ptr + i);
+        let byte = (wc & 0xFF) as u8;
+        if !dest.is_null() {
+            env.mem.write(dest + i, byte);
+        }
+        if wc == 0 {
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
+        }
+        i += 1;
+    }
+    if !dest.is_null() {
+        env.mem.write(src, src_ptr + i);
+    }
+    i
+}
+
+fn wcsnrtombs(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    nwc: GuestUSize,
+    len: GuestUSize,
+    _ps: crate::mem::MutVoidPtr,
+) -> GuestUSize {
+    if src.is_null() {
+        return 0;
+    }
+    let src_ptr: ConstPtr<wchar_t> = env.mem.read(src);
+    if src_ptr.is_null() {
+        return 0;
+    }
+    let max_count = if dest.is_null() { nwc } else { nwc.min(len) };
+    let mut i: GuestUSize = 0;
+    while i < max_count {
+        let wc = env.mem.read(src_ptr + i);
+        let byte = (wc & 0xFF) as u8;
+        if !dest.is_null() {
+            env.mem.write(dest + i, byte);
+        }
+        if wc == 0 {
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
+        }
+        i += 1;
+    }
+    if !dest.is_null() {
+        env.mem.write(src, src_ptr + i);
+    }
+    i
+}
+
+fn wcsnrtombs_l(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    nwc: GuestUSize,
+    len: GuestUSize,
+    ps: crate::mem::MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    wcsnrtombs(env, dest, src, nwc, len, ps)
+}
+
+fn wcstoll(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> i64 {
+    let mut buf = String::new();
+    let mut i: GuestUSize = 0;
+    loop {
+        let wc = env.mem.read(s + i);
+        if wc == 0 || wc > 0x7F {
+            break;
+        }
+        buf.push(wc as u8 as char);
+        i += 1;
+    }
+    let buf = buf.trim();
+    let result = if base == 0 || base == 10 {
+        buf.parse::<i64>().unwrap_or(0)
+    } else if base == 16 {
+        i64::from_str_radix(buf.trim_start_matches("0x"), 16).unwrap_or(0)
+    } else {
+        i64::from_str_radix(buf, base as u32).unwrap_or(0)
+    };
+    if !endptr.is_null() {
+        env.mem.write(endptr, (s + i).cast_mut());
+    }
+    result
+}
+
+fn wcstoull(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> u64 {
+    wcstoll(env, s, endptr, base) as u64
+}
+
+fn wcstold(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
+    wcstod(env, s, endptr)
+}
+
+fn wcscoll(env: &mut Environment, s1: ConstPtr<wchar_t>, s2: ConstPtr<wchar_t>) -> i32 {
+    wcscmp(env, s1, s2)
+}
+
+fn wcscoll_l(
+    env: &mut Environment,
+    s1: ConstPtr<wchar_t>,
+    s2: ConstPtr<wchar_t>,
+    _loc: crate::libc::clocale::locale_t,
+) -> i32 {
+    wcscmp(env, s1, s2)
+}
+
+fn wcsxfrm(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+) -> GuestUSize {
+    let len = wcslen(env, src);
+    if !dest.is_null() && n > 0 {
+        wcslcpy(env, dest, src, n);
+    }
+    len
+}
+
+fn wcsxfrm_l(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    wcsxfrm(env, dest, src, n)
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(btowc(_)),
     export_c_func!(wctob(_)),
@@ -771,4 +1070,24 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(ungetwc(_, _)),
     export_c_func!(mbsrtowcs(_, _, _, _)),
     export_c_func!(mbsrtowcs_l(_, _, _, _, _)),
+    export_c_func!(btowc_l(_, _)),
+    export_c_func!(wctob_l(_, _)),
+    export_c_func!(mbrtowc(_, _, _, _)),
+    export_c_func!(mbrtowc_l(_, _, _, _, _)),
+    export_c_func!(wcrtomb(_, _, _)),
+    export_c_func!(wcrtomb_l(_, _, _, _)),
+    export_c_func!(mbrlen(_, _, _)),
+    export_c_func!(mbrlen_l(_, _, _, _)),
+    export_c_func!(mbsnrtowcs(_, _, _, _, _)),
+    export_c_func!(mbsnrtowcs_l(_, _, _, _, _, _)),
+    export_c_func!(wcsrtombs(_, _, _, _)),
+    export_c_func!(wcsnrtombs(_, _, _, _, _)),
+    export_c_func!(wcsnrtombs_l(_, _, _, _, _, _)),
+    export_c_func!(wcstoll(_, _, _)),
+    export_c_func!(wcstoull(_, _, _)),
+    export_c_func!(wcstold(_, _)),
+    export_c_func!(wcscoll(_, _)),
+    export_c_func!(wcscoll_l(_, _, _)),
+    export_c_func!(wcsxfrm(_, _, _)),
+    export_c_func!(wcsxfrm_l(_, _, _, _)),
 ];

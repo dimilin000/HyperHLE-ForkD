@@ -229,7 +229,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Apps (e.g. Puzzle Agent) use it together with operatingSystemName for
     // platform diagnostics.
     let (major, minor, patch) = os_version(env);
-    let s = format!("Version {major}.{minor}.{patch} (Build 16A366)");
+    let build = match major {
+        10 => "14G60",
+        9 => "13G36",
+        8 => "12H321",
+        7 => "11D257",
+        6 => "10B500",
+        5 => "9B206",
+        4 => "8L1",
+        _ => "14G60",
+    };
+    let s = format!("Version {major}.{minor}.{patch} (Build {build})");
     let cstr = env.mem.alloc_and_write_cstr(s.as_bytes());
     msg_class![env; NSString stringWithUTF8String:cstr]
 }

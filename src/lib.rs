@@ -313,6 +313,9 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     }
 
     let bundle_path = if let Some(bundle_path) = bundle_path {
+        let mut saved_args = environment::app_picker::persisted_picker_option_args();
+        saved_args.extend(option_args);
+        option_args = saved_args;
         bundle_path
     } else {
         let mut options = options::Options::default();
@@ -496,16 +499,16 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         };
         let major: u32 = major_str.parse().unwrap_or(0);
         let minor: u32 = minor_str.parse().unwrap_or(0);
-        // Apps targeting up to iOS 9.0 attempt to run silently. Only warn
-        // when the deployment target is beyond iOS 9, where breakage from
-        // missing post-iOS-9 APIs becomes the rule rather than the exception.
-        if major > 9 || (major == 9 && minor > 0) {
+        // Apps targeting up to iOS 10.x (the last 32-bit iOS release on iPhone 5 / 5c)
+        // run without warning. Only warn when the deployment target is iOS 11+.
+        if major > 10 {
             echo!(
-                "Warning: app requires OS version {}. touchHLE currently aims \
-                 for iOS 2.x–9.0; newer APIs may be missing.",
+                "Warning: app requires OS version {}. HyperHLE supports 32-bit iOS \
+                 apps up to iOS 10.3.3 (iPhone 5 / 5c); 64-only iOS 11+ APIs may be missing.",
                 version
             );
         }
+        let _ = minor;
     }
 
     if required_device_capabilities.contains(&"opengles-3") {

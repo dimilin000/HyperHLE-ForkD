@@ -213,9 +213,12 @@ fn encode_a32_trap() -> u32 {
 }
 
 fn alloc_a32_ret_stub(mem: &mut Mem) -> MutPtr<u32> {
-    let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-    mem.write(fn_ptr + 0, encode_a32_ret());
-    mem.write(fn_ptr + 1, encode_a32_trap());
+    let fn_ptr: MutPtr<u32> = mem.alloc(12).cast();
+    // mov r0, #0 (0xe3a00000) so C++ ABI vtable methods (__is_pointer_p, __do_catch, etc.)
+    // return false (0) rather than leaving `this` in r0!
+    mem.write(fn_ptr + 0, 0xe3a00000);
+    mem.write(fn_ptr + 1, encode_a32_ret());
+    mem.write(fn_ptr + 2, encode_a32_trap());
     fn_ptr
 }
 
@@ -528,9 +531,9 @@ impl Dyld {
         self.return_to_host_routine =
             Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
-        // Currently assuming only the app binary contains Objective-C things.
-
-        objc.register_bin_selectors(&bins[0], mem);
+        for bin in bins {
+            objc.register_bin_selectors(bin, mem);
+        }
         objc.register_host_selectors(mem);
         for bin in bins {
             self.setup_lazy_linking(bin, mem);
@@ -539,10 +542,15 @@ impl Dyld {
             self.do_non_lazy_linking(bin, bins, mem, objc);
         }
 
-        objc.register_bin_classes(bundle, &bins[0], mem);
-        objc.register_bin_categories(&bins[0], mem);
-
-        ns_string::register_constant_strings(&bins[0], mem, objc);
+        for bin in bins {
+            objc.register_bin_classes(bundle, bin, mem);
+        }
+        for bin in bins {
+            objc.register_bin_categories(bin, mem);
+        }
+        for bin in bins {
+            ns_string::register_constant_strings(bin, mem, objc);
+        }
 
         // The `std::__throw_*` helpers in the bundled libstdc++ dylib are
         // `noreturn` — they construct and throw a C++ exception. touchHLE
@@ -642,6 +650,9 @@ impl Dyld {
                 // instead of the throw / over-sized-copy path.
                 patch_string_s_construct_null(dylib, mem);
             }
+        }
+        for dylib in bins.iter().skip(1) {
+            patch_string_s_construct_null(dylib, mem);
         }
     }
 
@@ -800,76 +811,82 @@ impl Dyld {
     /// These stubs already exist in the binary, but they need to be rewritten
     /// so that they will invoke our dynamic linker.
     fn setup_lazy_linking(&self, bin: &MachO, mem: &mut Mem) {
-        let Some(stubs) = bin.get_section(SectionType::SymbolStubs) else {
-            return;
-        };
-
-        let Some(indirect_info) = stubs.dyld_indirect_symbol_info.as_ref() else {
-            log!(
-                "Warning: setup_lazy_linking: __symbol_stub section is missing dyld indirect symbol info; skipping lazy stub rewrite."
-            );
-            return;
-        };
-        let entry_size = indirect_info.entry_size;
-
-        // two or three A32 instructions (PIC stub needs one more) followed by
-        // the address or offset of the corresponding __la_symbol_ptr
-        let expected_instructions: &[u32] = match entry_size {
-            4 => &[],
-            12 => Self::SYMBOL_STUB_INSTRUCTIONS.as_slice(),
-            16 => Self::PIC_SYMBOL_STUB_INSTRUCTIONS.as_slice(),
-            other => {
+        for stubs in bin
+            .sections
+            .iter()
+            .filter(|s| s.type_ == SectionType::SymbolStubs)
+        {
+            let Some(indirect_info) = stubs.dyld_indirect_symbol_info.as_ref() else {
                 log!(
-                    "Warning: setup_lazy_linking: unsupported stub entry size {}; skipping lazy stub rewrite.",
-                    other
+                    "Warning: setup_lazy_linking: __symbol_stub section is missing dyld indirect symbol info; skipping lazy stub rewrite."
                 );
-                return;
-            }
-        };
+                continue;
+            };
+            let entry_size = indirect_info.entry_size;
 
-        assert!(stubs.size % entry_size == 0);
-        let stub_count = stubs.size / entry_size;
-        for i in 0..stub_count {
-            let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
-
-            // Check that the stub matches the expected pattern.
-            // Some apps (e.g. Thumb-compiled) may have different patterns —
-            // skip them rather than panicking.
-            let mut mismatch = false;
-            for (j, &instr) in expected_instructions.iter().enumerate() {
-                if mem.read(ptr + j.try_into().unwrap()) != instr {
-                    log_dbg!(
-                        "Warning: stub {} at {:#x} has unexpected instruction at offset {} \
-                         (expected {:#010x}, got {:#010x}), skipping",
-                        i,
-                        stubs.addr + i * entry_size,
-                        j,
-                        instr,
-                        mem.read::<u32, true>(ptr + j.try_into().unwrap())
+            // two or three A32 instructions (PIC stub needs one more) followed by
+            // the address or offset of the corresponding __la_symbol_ptr
+            let expected_instructions: &[u32] = match entry_size {
+                4 => &[],
+                12 => Self::SYMBOL_STUB_INSTRUCTIONS.as_slice(),
+                16 => Self::PIC_SYMBOL_STUB_INSTRUCTIONS.as_slice(),
+                other => {
+                    log!(
+                        "Warning: setup_lazy_linking: unsupported stub entry size {}; skipping lazy stub rewrite.",
+                        other
                     );
-                    mismatch = true;
-                    break;
+                    continue;
                 }
-            }
-            if mismatch {
+            };
+
+            if entry_size == 0 || stubs.size % entry_size != 0 {
                 continue;
             }
+            let stub_count = stubs.size / entry_size;
+            for i in 0..stub_count {
+                let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
 
-            // For convenience, make the stub return once the SVC is done
-            // (Otherwise we have to manually update the PC)
-            if entry_size == 4 {
-                mem.write(ptr + 0, encode_a32_svc(Self::SVC_LAZY_LINK_RET_FLAG));
-            } else {
-                mem.write(ptr + 0, encode_a32_svc(Self::SVC_LAZY_LINK));
-                mem.write(ptr + 1, encode_a32_ret());
+                // Check that the stub matches the expected pattern.
+                // Some apps (e.g. Thumb-2 stubs in iOS 7–10 ARMv7 binaries) have
+                // different instruction patterns — skip rewriting the stub here;
+                // `do_non_lazy_linking` eagerly binds all `__la_symbol_ptr` entries
+                // so Thumb-2 stubs jump directly to the resolved target.
+                let mut mismatch = false;
+                for (j, &instr) in expected_instructions.iter().enumerate() {
+                    if mem.read(ptr + j.try_into().unwrap()) != instr {
+                        log_dbg!(
+                            "Warning: stub {} at {:#x} has unexpected instruction at offset {} \
+                             (expected {:#010x}, got {:#010x}), skipping",
+                            i,
+                            stubs.addr + i * entry_size,
+                            j,
+                            instr,
+                            mem.read::<u32, true>(ptr + j.try_into().unwrap())
+                        );
+                        mismatch = true;
+                        break;
+                    }
+                }
+                if mismatch {
+                    continue;
+                }
+
+                // For convenience, make the stub return once the SVC is done
+                // (Otherwise we have to manually update the PC)
+                if entry_size == 4 {
+                    mem.write(ptr + 0, encode_a32_svc(Self::SVC_LAZY_LINK_RET_FLAG));
+                } else {
+                    mem.write(ptr + 0, encode_a32_svc(Self::SVC_LAZY_LINK));
+                    mem.write(ptr + 1, encode_a32_ret());
+                }
+                if entry_size == 16 {
+                    // This is preceded by a return instruction, so if we do execute
+                    // it, something has gone wrong.
+                    mem.write(ptr + 2, encode_a32_trap());
+                }
+                // Leave the __la_symbol_ptr intact in case we want to link it to
+                // a real symbol later.
             }
-            if entry_size == 16 {
-                // This is preceded by a return instruction, so if we do execute
-                // it, something has gone wrong.
-                mem.write(ptr + 2, encode_a32_trap());
-            }
-            // Leave the __la_symbol_ptr intact in case we want to link it to
-            // a real symbol later.
         }
     }
 
@@ -1231,12 +1248,32 @@ impl Dyld {
                 // games compiled with older toolchains).
                 self.constants_to_link_later.push((ptr_ptr, template));
                 continue;
+            } else if let Some(addr) = local_code_symbol(bin, name) {
+                Ptr::from_bits(addr)
+            } else if name.starts_with("__ZTV") {
+                link_cxxabi_vtable(
+                    name,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                )
+            } else if name.starts_with("__ZTI") {
+                link_cxxabi_typeinfo(
+                    name,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                )
+            } else if name.starts_with("__ZTS") {
+                let cstr = mem.alloc_and_write_cstr(name.strip_prefix("__ZTS").unwrap_or(name).as_bytes());
+                cstr.cast().cast_const()
             } else {
                 unhandled_relocations
                     .entry(name)
                     .or_default()
                     .push(ptr_ptr.to_bits());
-                continue;
+                let stub = alloc_a32_ret_stub(mem);
+                stub.cast().cast_const()
             };
             // wrapping_add() is used in case the offset is negative. I haven't
             // seen it happen, but it would make sense if that is allowed.
@@ -1260,16 +1297,22 @@ impl Dyld {
             );
         }
 
-        let Some(ptrs) = bin.get_section(SectionType::NonLazySymbolPointers) else {
-            return;
-        };
-        let info = ptrs.dyld_indirect_symbol_info.as_ref().unwrap();
+        for ptrs in bin.sections.iter().filter(|s| {
+            matches!(
+                s.type_,
+                SectionType::NonLazySymbolPointers | SectionType::LazySymbolPointers
+            )
+        }) {
+            let Some(info) = ptrs.dyld_indirect_symbol_info.as_ref() else {
+                continue;
+            };
 
-        let entry_size = info.entry_size;
-        assert!(entry_size == 4);
-        assert!(ptrs.size % entry_size == 0);
-        let ptr_count = ptrs.size / entry_size;
-        'ptr_loop: for i in 0..ptr_count {
+            let entry_size = info.entry_size;
+            if entry_size != 4 || ptrs.size % entry_size != 0 {
+                continue;
+            }
+            let ptr_count = ptrs.size / entry_size;
+            'ptr_loop: for i in 0..ptr_count {
             let Some(symbol) = info.indirect_undef_symbols[i as usize].as_deref() else {
                 continue;
             };
@@ -1577,12 +1620,61 @@ impl Dyld {
                 continue;
             }
 
+            if let Some(stub) = self.cxxabi_intercept(mem, symbol) {
+                mem.write(ptr_ptr, stub.to_ptr());
+                continue;
+            }
+
+            if let Some(addr) = local_code_symbol(bin, symbol) {
+                mem.write(ptr_ptr, Ptr::from_bits(addr));
+                continue;
+            }
+
+            if symbol.starts_with("__ZTV") {
+                let target = link_cxxabi_vtable(
+                    symbol,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                );
+                mem.write(ptr_ptr, target);
+                continue;
+            }
+
+            if symbol.starts_with("__ZTI") {
+                let ti = link_cxxabi_typeinfo(
+                    symbol,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                );
+                mem.write(ptr_ptr, ti);
+                continue;
+            }
+
+            if symbol.starts_with("__ZTS") {
+                let cstr = mem.alloc_and_write_cstr(symbol.strip_prefix("__ZTS").unwrap_or(symbol).as_bytes());
+                mem.write(ptr_ptr, cstr.cast().cast_const());
+                continue;
+            }
+
             log!(
-                "Warning: unhandled non-lazy symbol {:?} at {:?} in \"{}\"",
+                "Warning: unhandled symbol pointer {:?} at {:?} in \"{}\"; installing return-0 stub",
                 symbol,
                 ptr_ptr,
                 bin.name
             );
+            let leaked_symbol: &'static str = Box::leak(symbol.to_string().into_boxed_str());
+            let f: HostFunction = &(unimplemented_function_stub as fn(&mut Environment) -> i32);
+            let function_ptr = if let Some(&cached) = self.non_lazy_host_functions.get(leaked_symbol) {
+                cached
+            } else {
+                let created = self.create_guest_function(mem, leaked_symbol, f);
+                self.non_lazy_host_functions.insert(leaked_symbol, created);
+                created
+            };
+            mem.write(ptr_ptr, function_ptr.to_ptr());
+            }
         }
 
         // FIXME: check for internal relocations?
@@ -1737,7 +1829,11 @@ impl Dyld {
         }
 
         let Some((stub_bin, stubs, pic_offset, offset)) = bins.iter().find_map(|bin| {
-            let stubs = bin.get_section(SectionType::SymbolStubs)?;
+            let stubs = bin
+                .sections
+                .iter()
+                .filter(|s| s.type_ == SectionType::SymbolStubs)
+                .find(|s| lazy_stub_section_offset(s.addr, s.size, svc_pc).is_some())?;
             let offset = lazy_stub_section_offset(stubs.addr, stubs.size, svc_pc)?;
             let pic_offset = bin
                 .get_section(SectionType::LazySymbolPointers)

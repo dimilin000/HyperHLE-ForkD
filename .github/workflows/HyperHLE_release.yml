@@ -633,7 +633,10 @@ jobs:
 
     - name: Create bundle
       shell: bash
-      run: cd dev-scripts && sh ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+      run: |
+        cd dev-scripts && sh ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+        mkdir -p touchHLE_windows_bundle/touchHLE_apps
+        cp touchHLE_apps/README.txt touchHLE_windows_bundle/touchHLE_apps/ 2>/dev/null || true
 
     - uses: actions/upload-artifact@main
       with:

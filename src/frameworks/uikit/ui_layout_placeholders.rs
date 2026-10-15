@@ -323,6 +323,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (id)leadingAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)trailingAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)leftAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)rightAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)topAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)bottomAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)widthAnchor { msg_class![env; NSLayoutDimension new] }
+- (id)heightAnchor { msg_class![env; NSLayoutDimension new] }
+- (id)centerXAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)centerYAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+
 - (())dealloc {
     let &UILayoutGuideHostObject { identifier, .. } = env.objc.borrow(this);
     if identifier != nil { release(env, identifier); }
@@ -795,6 +806,300 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)delegate { nil }
 - (())setDelegate:(id)_delegate { }
 - (())disconnect { }
+@end
+
+// ============================================================================
+// iOS 8–10 UIKit & WebKit Classes
+// ============================================================================
+
+@implementation UITraitCollection: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
++ (id)_touchHLE_defaultTraitCollection {
+    let tc: id = msg![env; this alloc];
+    let tc: id = msg![env; tc init];
+    autorelease(env, tc)
+}
++ (id)traitCollectionWithHorizontalSizeClass:(i32)_size_class {
+    msg![env; this _touchHLE_defaultTraitCollection]
+}
++ (id)traitCollectionWithVerticalSizeClass:(i32)_size_class {
+    msg![env; this _touchHLE_defaultTraitCollection]
+}
++ (id)traitCollectionWithDisplayScale:(f32)_scale {
+    msg![env; this _touchHLE_defaultTraitCollection]
+}
++ (id)traitCollectionWithUserInterfaceIdiom:(i32)_idiom {
+    msg![env; this _touchHLE_defaultTraitCollection]
+}
++ (id)traitCollectionWithForceTouchCapability:(i32)_cap {
+    msg![env; this _touchHLE_defaultTraitCollection]
+}
++ (id)traitCollectionWithTraitsFromCollections:(id)_collections {
+    msg![env; this _touchHLE_defaultTraitCollection]
+}
+- (id)init { this }
+- (id)copyWithZone:(NSZonePtr)_zone { retain(env, this) }
+- (i32)userInterfaceIdiom {
+    if env.window().device_family().is_ipad() { 1 } else { 0 }
+}
+- (f32)displayScale {
+    if env.window().device_family().is_retina() { 2.0 } else { 1.0 }
+}
+- (i32)horizontalSizeClass {
+    if env.window().device_family().is_ipad() { 2 } else { 1 } // Regular = 2, Compact = 1
+}
+- (i32)verticalSizeClass { 2 } // Regular = 2
+- (i32)forceTouchCapability { 1 } // UIForceTouchCapabilityUnavailable = 1
+- (i32)layoutDirection { 0 } // LeftToRight = 0
+- (id)preferredContentSizeCategory {
+    get_static_str(env, "UICTContentSizeCategoryL")
+}
+- (bool)containsTraitsInCollection:(id)_other { true }
+@end
+
+@implementation UIVisualEffect: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+- (id)init { this }
+- (id)copyWithZone:(NSZonePtr)_zone { retain(env, this) }
+@end
+
+@implementation UIBlurEffect: UIVisualEffect
++ (id)effectWithStyle:(i32)_style {
+    let e: id = msg![env; this alloc];
+    let e: id = msg![env; e init];
+    autorelease(env, e)
+}
+@end
+
+@implementation UIVibrancyEffect: UIVisualEffect
++ (id)effectForBlurEffect:(id)_blur {
+    let e: id = msg![env; this alloc];
+    let e: id = msg![env; e init];
+    autorelease(env, e)
+}
+@end
+
+@implementation UIVisualEffectView: UIView
+- (id)initWithEffect:(id)_effect {
+    msg_super![env; this init]
+}
+- (id)contentView {
+    this
+}
+- (id)effect { nil }
+- (())setEffect:(id)_effect { }
+@end
+
+@implementation UIStackView: UIView
+- (id)initWithArrangedSubviews:(id)views {
+    let this: id = msg_super![env; this init];
+    if views != nil {
+        let count: u32 = msg![env; views count];
+        for i in 0..count {
+            let v: id = msg![env; views objectAtIndex:i];
+            let _: () = msg![env; this addSubview:v];
+        }
+    }
+    this
+}
+- (id)arrangedSubviews {
+    msg![env; this subviews]
+}
+- (())addArrangedSubview:(id)view {
+    if view != nil {
+        let _: () = msg![env; this addSubview:view];
+    }
+}
+- (())removeArrangedSubview:(id)_view { }
+- (())insertArrangedSubview:(id)view atIndex:(u32)_idx {
+    if view != nil {
+        let _: () = msg![env; this addSubview:view];
+    }
+}
+- (i32)axis { 0 }
+- (())setAxis:(i32)_axis { }
+- (i32)distribution { 0 }
+- (())setDistribution:(i32)_dist { }
+- (i32)alignment { 0 }
+- (())setAlignment:(i32)_align { }
+- (f32)spacing { 0.0 }
+- (())setSpacing:(f32)_spacing { }
+- (bool)isBaselineRelativeArrangement { false }
+- (())setBaselineRelativeArrangement:(bool)_flag { }
+- (bool)isLayoutMarginsRelativeArrangement { false }
+- (())setLayoutMarginsRelativeArrangement:(bool)_flag { }
+@end
+
+@implementation NSLayoutAnchor: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+- (id)init { this }
+- (id)constraintEqualToAnchor:(id)_anchor {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintGreaterThanOrEqualToAnchor:(id)_anchor {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintLessThanOrEqualToAnchor:(id)_anchor {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintEqualToAnchor:(id)_anchor constant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintGreaterThanOrEqualToAnchor:(id)_anchor constant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintLessThanOrEqualToAnchor:(id)_anchor constant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+@end
+
+@implementation NSLayoutXAxisAnchor: NSLayoutAnchor
+@end
+
+@implementation NSLayoutYAxisAnchor: NSLayoutAnchor
+@end
+
+@implementation NSLayoutDimension: NSLayoutAnchor
+- (id)constraintEqualToConstant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintGreaterThanOrEqualToConstant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintLessThanOrEqualToConstant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintEqualToAnchor:(id)_anchor multiplier:(f32)_m {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintGreaterThanOrEqualToAnchor:(id)_anchor multiplier:(f32)_m {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintLessThanOrEqualToAnchor:(id)_anchor multiplier:(f32)_m {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintEqualToAnchor:(id)_anchor multiplier:(f32)_m constant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintGreaterThanOrEqualToAnchor:(id)_anchor multiplier:(f32)_m constant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+- (id)constraintLessThanOrEqualToAnchor:(id)_anchor multiplier:(f32)_m constant:(f32)_c {
+    msg_class![env; NSLayoutConstraint new]
+}
+@end
+
+@implementation WKWebViewConfiguration: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+- (id)init { this }
+- (id)copyWithZone:(NSZonePtr)_zone { retain(env, this) }
+- (id)userContentController { msg_class![env; WKUserContentController new] }
+- (())setUserContentController:(id)_c { }
+- (id)preferences { msg_class![env; WKPreferences new] }
+- (())setPreferences:(id)_p { }
+- (id)processPool { msg_class![env; WKProcessPool new] }
+- (())setProcessPool:(id)_p { }
+- (id)websiteDataStore { msg_class![env; WKWebsiteDataStore defaultDataStore] }
+- (())setWebsiteDataStore:(id)_s { }
+- (bool)allowsInlineMediaPlayback { true }
+- (())setAllowsInlineMediaPlayback:(bool)_v { }
+- (bool)mediaPlaybackRequiresUserAction { false }
+- (())setMediaPlaybackRequiresUserAction:(bool)_v { }
+- (u32)mediaTypesRequiringUserActionForPlayback { 0 }
+- (())setMediaTypesRequiringUserActionForPlayback:(u32)_v { }
+@end
+
+@implementation WKUserContentController: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+- (id)init { this }
+- (())addScriptMessageHandler:(id)_handler name:(id)_name { }
+- (())removeScriptMessageHandlerForName:(id)_name { }
+- (())addUserScript:(id)_script { }
+- (())removeAllUserScripts { }
+- (id)userScripts { msg_class![env; NSArray array] }
+@end
+
+@implementation WKPreferences: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+- (id)init { this }
+- (bool)javaScriptEnabled { true }
+- (())setJavaScriptEnabled:(bool)_v { }
+- (bool)javaScriptCanOpenWindowsAutomatically { false }
+- (())setJavaScriptCanOpenWindowsAutomatically:(bool)_v { }
+- (f32)minimumFontSize { 0.0 }
+- (())setMinimumFontSize:(f32)_s { }
+@end
+
+@implementation WKProcessPool: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+- (id)init { this }
+@end
+
+@implementation WKWebsiteDataStore: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
++ (id)defaultDataStore {
+    let s: id = msg![env; this alloc];
+    let s: id = msg![env; s init];
+    autorelease(env, s)
+}
++ (id)nonPersistentDataStore {
+    msg![env; this defaultDataStore]
+}
++ (id)allWebsiteDataTypes {
+    msg_class![env; NSSet set]
+}
+- (id)init { this }
+- (bool)isPersistent { true }
+- (())removeDataOfTypes:(id)_types modifiedSince:(id)_date completionHandler:(id)_handler { }
+- (())fetchDataRecordsOfTypes:(id)_types completionHandler:(id)_handler { }
+@end
+
+@implementation WKWebView: UIView
+- (id)initWithFrame:(crate::frameworks::core_graphics::CGRect)frame configuration:(id)_config {
+    msg_super![env; this initWithFrame:frame]
+}
+- (id)configuration { msg_class![env; WKWebViewConfiguration new] }
+- (id)navigationDelegate { nil }
+- (())setNavigationDelegate:(id)_d { }
+- (id)UIDelegate { nil }
+- (())setUIDelegate:(id)_d { }
+- (id)scrollView {
+    let bounds: crate::frameworks::core_graphics::CGRect = msg![env; this bounds];
+    let sv: id = msg_class![env; UIScrollView alloc];
+    let sv: id = msg![env; sv initWithFrame:bounds];
+    autorelease(env, sv)
+}
+- (id)loadRequest:(id)_request { nil }
+- (id)loadHTMLString:(id)_html baseURL:(id)_base_url { nil }
+- (id)loadFileURL:(id)_url allowingReadAccessToURL:(id)_read_url { nil }
+- (id)loadData:(id)_data MIMEType:(id)_mime characterEncodingName:(id)_enc baseURL:(id)_base { nil }
+- (())stopLoading { }
+- (id)reload { nil }
+- (bool)isLoading { false }
+- (bool)canGoBack { false }
+- (bool)canGoForward { false }
+- (id)goBack { nil }
+- (id)goForward { nil }
+- (id)URL { nil }
+- (id)title { get_static_str(env, "") }
+- (f64)estimatedProgress { 1.0 }
+- (())evaluateJavaScript:(id)_js completionHandler:(id)_handler { }
 @end
 
 };

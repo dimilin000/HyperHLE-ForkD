@@ -2004,7 +2004,34 @@ pub const FUNCTIONS: FunctionExports = &[
     // bundled libz.1.2.3.dylib doesn't have it. Some apps (Flappy Bird)
     // import it.
     export_c_func!(inflateReset2(_, _)),
+    export_c_func!(getsectdatafromheader(_, _, _, _)),
 ];
+
+fn getsectdatafromheader(
+    env: &mut Environment,
+    _mhp: ConstVoidPtr,
+    _segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+    size: MutPtr<u32>,
+) -> MutPtr<u8> {
+    let sect = if sectname.is_null() {
+        ""
+    } else {
+        env.mem.cstr_at_utf8(sectname).unwrap_or("")
+    };
+    for bin in &env.bins {
+        if let Some(section) = bin.sections.iter().find(|s| s.name == sect) {
+            if !size.is_null() {
+                env.mem.write(size, section.size);
+            }
+            return Ptr::from_bits(section.addr);
+        }
+    }
+    if !size.is_null() {
+        env.mem.write(size, 0);
+    }
+    Ptr::null()
+}
 
 pub fn atof_inner(
     env: &mut Environment,

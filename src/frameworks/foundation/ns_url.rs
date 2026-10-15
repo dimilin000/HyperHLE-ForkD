@@ -667,15 +667,34 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)URLByAppendingPathComponent:(id)path_component // NSString*
                       isDirectory:(bool)is_directory {
-    let &NSURLHostObject::FileURL { ns_string, .. } = env.objc.borrow(this) else {
-        log!("Warning: URLByAppendingPathComponent: called on non-file URL");
+    if path_component == nil {
         return this;
-    };
-    let mut path: id = msg![env; ns_string stringByAppendingPathComponent:path_component];
-    if is_directory {
-        path = msg![env; path stringByAppendingString:(get_static_str(env, "/"))];
     }
-    msg_class![env; NSURL fileURLWithPath:path]
+    match *env.objc.borrow(this) {
+        NSURLHostObject::FileURL { ns_string, .. } => {
+            let mut path: id = msg![env; ns_string stringByAppendingPathComponent:path_component];
+            if is_directory {
+                path = msg![env; path stringByAppendingString:(get_static_str(env, "/"))];
+            }
+            msg_class![env; NSURL fileURLWithPath:path]
+        }
+        NSURLHostObject::OtherURL { ns_string } => {
+            let base_str = to_rust_string(env, ns_string);
+            let comp_str = to_rust_string(env, path_component);
+            let mut joined = base_str.into_owned();
+            if !joined.ends_with('/') && !comp_str.starts_with('/') {
+                joined.push('/');
+            }
+            joined.push_str(comp_str.trim_start_matches('/'));
+            if is_directory && !joined.ends_with('/') {
+                joined.push('/');
+            }
+            let ns_joined = from_rust_string(env, joined);
+            let url: id = msg_class![env; NSURL URLWithString:ns_joined];
+            release(env, ns_joined);
+            url
+        }
+    }
 }
 
 - (id)URLByAppendingPathExtension:(id)ext { // NSString*
@@ -871,6 +890,79 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())removeCachedResponseForRequest:(id)_request { }
 - (())removeAllCachedResponses { }
+
+@end
+
+@implementation NSURLComponents: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+
++ (id)componentsWithString:(id)_url_str {
+    let c: id = msg![env; this alloc];
+    let c: id = msg![env; c init];
+    autorelease(env, c)
+}
+
++ (id)componentsWithURL:(id)_url resolvingAgainstBaseURL:(bool)_resolve {
+    let c: id = msg![env; this alloc];
+    let c: id = msg![env; c init];
+    autorelease(env, c)
+}
+
+- (id)init { this }
+- (id)initWithString:(id)_url_str { this }
+- (id)initWithURL:(id)_url resolvingAgainstBaseURL:(bool)_resolve { this }
+
+- (id)URL {
+    let s = get_static_str(env, "https://localhost/");
+    msg_class![env; NSURL URLWithString:s]
+}
+- (id)URLRelativeToURL:(id)_base {
+    msg![env; this URL]
+}
+- (id)string {
+    get_static_str(env, "https://localhost/")
+}
+- (id)scheme { get_static_str(env, "https") }
+- (())setScheme:(id)_s { }
+- (id)host { get_static_str(env, "localhost") }
+- (())setHost:(id)_h { }
+- (id)path { get_static_str(env, "/") }
+- (())setPath:(id)_p { }
+- (id)query { nil }
+- (())setQuery:(id)_q { }
+- (id)percentEncodedQuery { nil }
+- (())setPercentEncodedQuery:(id)_q { }
+- (id)queryItems { msg_class![env; NSArray array] }
+- (())setQueryItems:(id)_items { }
+- (id)fragment { nil }
+- (())setFragment:(id)_f { }
+- (id)port { nil }
+- (())setPort:(id)_p { }
+- (id)user { nil }
+- (())setUser:(id)_u { }
+- (id)password { nil }
+- (())setPassword:(id)_p { }
+
+@end
+
+@implementation NSURLQueryItem: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(crate::objc::TrivialHostObject), &mut env.mem)
+}
+
++ (id)queryItemWithName:(id)name value:(id)value {
+    let item: id = msg![env; this alloc];
+    let item: id = msg![env; item initWithName:name value:value];
+    autorelease(env, item)
+}
+
+- (id)initWithName:(id)_name value:(id)_value { this }
+- (id)name { get_static_str(env, "") }
+- (id)value { get_static_str(env, "") }
 
 @end
 

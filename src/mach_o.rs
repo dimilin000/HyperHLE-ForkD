@@ -775,7 +775,6 @@ impl MachO {
                             is_64bit,
                             &mut cursor,
                         );
-                        assert_eq!(slide, 0); // TODO
                         match sym {
                             Some(Symbol::Undefined { name: Some(n), .. }) => {
                                 external_relocations.push((addr, String::from(n)));
@@ -789,7 +788,7 @@ impl MachO {
                                 // in passing these on to Dyld.
                                 let addr = Ptr::from_bits(addr);
                                 let addend: u32 = into_mem.read(addr);
-                                let entry = entry as u32;
+                                let entry = (entry as u32).wrapping_add(slide);
                                 let entry = if desc & N_ARM_THUMB_DEF != 0 {
                                     entry | GuestFunction::THUMB_BIT
                                 } else {
@@ -871,12 +870,14 @@ impl MachO {
                     entry_point_is_lc_main = true;
                 }
                 // Used in iOS 3.1+ apps. Also contains info about
-                // weak and lazy binds, but we already handle those.
+                // weak and lazy binds.
                 LoadCommand::DyldInfo {
                     rebase_off,
                     rebase_size,
                     bind_off,
                     bind_size,
+                    weak_bind_off,
+                    weak_bind_size,
                     ..
                 } => {
                     fn checked_dyld_info_slice<'a>(
@@ -991,7 +992,13 @@ impl MachO {
                                 let addr = segment_offsets[symb.segment_index]
                                     + symb.symbol_offset as u32
                                     + slide;
-                                log_dbg!("Pointer bind: {:#x} -> {}", addr, symb.name);
+                                if symb.addend != 0 {
+                                    let ptr: MutPtr<u32> = Ptr::from_bits(addr);
+                                    if into_mem.read(ptr) == 0 {
+                                        into_mem.write(ptr, symb.addend as i32 as u32);
+                                    }
+                                }
+                                log_dbg!("Pointer bind: {:#x} -> {} (addend {})", addr, symb.name, symb.addend);
                                 external_relocations.push((addr, symb.name));
                             }
                             other => {
@@ -999,6 +1006,35 @@ impl MachO {
                                     "Warning: unhandled DyldInfo bind symbol type: {:?}; skipping.",
                                     other
                                 );
+                            }
+                        }
+                    }
+
+                    if weak_bind_size > 0 {
+                        let weak_bind_opcodes = Bind::parse(
+                            checked_dyld_info_slice(
+                                bytes,
+                                weak_bind_off as u64,
+                                weak_bind_size as u64,
+                                "weak_bind",
+                                &name,
+                            ),
+                            size_of::<GuestUSize>(),
+                        );
+                        for symb in weak_bind_opcodes {
+                            if matches!(symb.symbol_type, BindSymbolType::Pointer) {
+                                if symb.segment_index < segment_offsets.len() {
+                                    let addr = segment_offsets[symb.segment_index]
+                                        + symb.symbol_offset as u32
+                                        + slide;
+                                    let ptr: MutPtr<u32> = Ptr::from_bits(addr);
+                                    if into_mem.read(ptr) == 0 {
+                                        if symb.addend != 0 {
+                                            into_mem.write(ptr, symb.addend as i32 as u32);
+                                        }
+                                        external_relocations.push((addr, symb.name));
+                                    }
+                                }
                             }
                         }
                     }

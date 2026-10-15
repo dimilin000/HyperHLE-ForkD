@@ -31,8 +31,8 @@ pub enum Button {
     LeftShoulder,
 }
 
-/// Highest iOS version currently exposed by the emulator compatibility layer.
-pub const LATEST_IOS_VERSION: (i32, i32, i32) = (12, 0, 0);
+/// Highest 32-bit iOS version supported by iPhone 5 / 5c / iPad 4 (iOS 10.3.3).
+pub const LATEST_IOS_VERSION: (i32, i32, i32) = (10, 3, 3);
 
 /// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
 /// host window when the app draws into a fullscreen `CAEAGLLayer`

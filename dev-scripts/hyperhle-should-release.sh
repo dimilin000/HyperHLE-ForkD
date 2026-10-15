@@ -95,4 +95,3 @@ else
     echo "changelog_from=${changelog_from}"
     echo "changelog_limit=${changelog_limit:-}"
 fi
-

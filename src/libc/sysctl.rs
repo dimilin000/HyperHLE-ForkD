@@ -43,7 +43,7 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 38] = [
     ((6,22), "hw.l3cachesize", SysInfoType::Int32(0)),
     ((6,23), "hw.tbfreq", SysInfoType::Int64(1000000000)),
 
-    ((1, 14), "kern.osversion", String(b"11D257")),
+    ((1, 14), "kern.osversion", String(b"14G60")),
     ((6,5), "hw.physmem" , SysInfoType::Int32(1073741824)),
     ((6,6), "hw.usermem" , SysInfoType::Int32(805306368)),
     ((6,24), "hw.memsize" , SysInfoType::Int64(1073741824)),
@@ -51,10 +51,10 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 38] = [
     ((6,7), "hw.pagesize" , SysInfoType::Int32(PAGE_SIZE as i32)),
     // High kernel limits
     ((1,1), "kern.ostype" , String(b"Darwin")),
-    ((1,2), "kern.osrelease" , String(b"14.0.0")),
-    ((1,3), "kern.osversion" , String(b"11D257")),
+    ((1,2), "kern.osrelease" , String(b"16.6.0")),
+    ((1,3), "kern.osversion" , String(b"14G60")),
     ((1,10), "kern.hostname" , String(b"touchHLE")),
-    ((1,4), "kern.version" , String(b"Darwin Kernel Version 14.0.0: Fri May 16 00:08:52 PDT 2014; root:xnu-2423.10.70~1/RELEASE_ARM_S5L8940X")),
+    ((1,4), "kern.version" , String(b"Darwin Kernel Version 16.6.0: Mon Apr 17 17:33:34 PDT 2017; root:xnu-3789.60.24~24/RELEASE_ARM_S5L8950X")),
     ((1,21), "kern.boottime" , SysInfoType::Int64(1600000000)),
     // kern.proc.pid is a node for process information. Some games probe
     // it with sysctl([CTL_KERN, KERN_PROC, ...]) and only need success.

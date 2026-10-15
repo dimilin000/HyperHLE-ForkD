@@ -16,6 +16,8 @@ if [[ $# == 1 ]]; then
     cp -r ../touchHLE_fonts touchHLE_windows_bundle/
     cp -r ../touchHLE_default_options.txt touchHLE_windows_bundle/
     cp ../touchHLE_wallpaper.png touchHLE_windows_bundle/
+    mkdir -p touchHLE_windows_bundle/touchHLE_apps
+    cp ../touchHLE_apps/README.txt touchHLE_windows_bundle/touchHLE_apps/ 2>/dev/null || true
 else
     echo "Incorrect usage."
     exit 1

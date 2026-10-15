@@ -28,9 +28,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     instance
 }
 
+- (id)init { this }
 - (id)retain { this }
 - (())release {}
 - (id)autorelease { this }
+
++ (())load {}
++ (())start {}
++ (())setup {}
+- (())start {}
+- (())setup {}
+- (())show {}
+- (())dismiss {}
+- (bool)application:(id)_app didFinishLaunchingWithOptions:(id)_opts { true }
+- (())applicationDidBecomeActive:(id)_app {}
+- (())applicationWillResignActive:(id)_app {}
+- (())applicationDidEnterBackground:(id)_app {}
+- (())applicationWillEnterForeground:(id)_app {}
+- (())applicationWillTerminate:(id)_app {}
+- (id)window { crate::objc::nil }
+- (())setWindow:(id)_w {}
 
 @end
 

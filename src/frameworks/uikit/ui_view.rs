@@ -2014,10 +2014,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)traitCollection {
-    // iOS ≥ 8 asks views for their trait collection. Returning nil is the
-    // documented legacy behaviour for views not in a trait environment and
-    // satisfies engines probing for size classes without crashing.
-    nil
+    msg_class![env; UITraitCollection _touchHLE_defaultTraitCollection]
 }
 
 - (CGSize)sizeThatFits:(CGSize)size { size }
@@ -2115,6 +2112,39 @@ pub const CLASSES: ClassExports = objc_classes! {
         size: CGSize { width: 0.0, height: 0.0 },
     }
 }
+
+- (())traitCollectionDidChange:(id)_previous_trait_collection { }
+
+- (id)leadingAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)trailingAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)leftAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)rightAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)topAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)bottomAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)widthAnchor { msg_class![env; NSLayoutDimension new] }
+- (id)heightAnchor { msg_class![env; NSLayoutDimension new] }
+- (id)centerXAnchor { msg_class![env; NSLayoutXAxisAnchor new] }
+- (id)centerYAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)firstBaselineAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)lastBaselineAnchor { msg_class![env; NSLayoutYAxisAnchor new] }
+- (id)layoutMarginsGuide { msg_class![env; UILayoutGuide new] }
+- (id)readableContentGuide { msg_class![env; UILayoutGuide new] }
+- (id)safeAreaLayoutGuide { msg_class![env; UILayoutGuide new] }
+- (())addLayoutGuide:(id)_guide { }
+- (())removeLayoutGuide:(id)_guide { }
+- (id)layoutGuides { msg_class![env; NSArray array] }
+- (CGRect)layoutMargins {
+    CGRect {
+        origin: CGPoint { x: 8.0, y: 8.0 },
+        size: CGSize { width: 8.0, height: 8.0 },
+    }
+}
+- (())setLayoutMargins:(CGRect)_margins { }
+- (bool)preservesSuperviewLayoutMargins { false }
+- (())setPreservesSuperviewLayoutMargins:(bool)_flag { }
+- (())layoutMarginsDidChange { }
+- (i32)semanticContentAttribute { 0 }
+- (())setSemanticContentAttribute:(i32)_attr { }
 
 @end
 

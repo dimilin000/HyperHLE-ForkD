@@ -156,6 +156,58 @@ fn nl_langinfo_l(env: &mut Environment, item: i32, _locale: locale_t) -> ConstPt
     nl_langinfo(env, item)
 }
 
+fn strcoll_l(
+    env: &mut Environment,
+    s1: ConstPtr<u8>,
+    s2: ConstPtr<u8>,
+    _locale: locale_t,
+) -> i32 {
+    let a = env.mem.cstr_at(s1);
+    let b = env.mem.cstr_at(s2);
+    a.cmp(b) as i32
+}
+
+fn strxfrm_l(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: crate::mem::GuestUSize,
+    _locale: locale_t,
+) -> crate::mem::GuestUSize {
+    let src_bytes = env.mem.cstr_at(src).to_vec();
+    let len = src_bytes.len() as crate::mem::GuestUSize;
+    if !dest.is_null() && n > 0 {
+        let copy_len = len.min(n - 1);
+        for i in 0..copy_len {
+            env.mem.write(dest + i, src_bytes[i as usize]);
+        }
+        env.mem.write(dest + copy_len, 0u8);
+    }
+    len
+}
+
+fn catopen(_env: &mut Environment, _name: ConstPtr<u8>, _oflag: i32) -> MutVoidPtr {
+    MutVoidPtr::from_bits(u32::MAX)
+}
+
+fn catgets(
+    _env: &mut Environment,
+    _catd: MutVoidPtr,
+    _set_id: i32,
+    _msg_id: i32,
+    s: ConstPtr<u8>,
+) -> ConstPtr<u8> {
+    s
+}
+
+fn catclose(_env: &mut Environment, _catd: MutVoidPtr) -> i32 {
+    0
+}
+
+fn querylocale(env: &mut Environment, _mask: i32, _loc: locale_t) -> ConstPtr<u8> {
+    env.mem.alloc_and_write_cstr(b"C").cast_const()
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(setlocale(_, _)),
     export_c_func!(newlocale(_, _, _)),
@@ -166,4 +218,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(localeconv_l(_)),
     export_c_func!(nl_langinfo(_)),
     export_c_func!(nl_langinfo_l(_, _)),
+    export_c_func!(strcoll_l(_, _, _)),
+    export_c_func!(strxfrm_l(_, _, _, _)),
+    export_c_func!(catopen(_, _)),
+    export_c_func!(catgets(_, _, _, _)),
+    export_c_func!(catclose(_)),
+    export_c_func!(querylocale(_, _)),
 ];

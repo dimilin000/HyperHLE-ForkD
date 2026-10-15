@@ -1314,6 +1314,46 @@ fn vsnprintf_l(
     vsnprintf(env, dest, n, format, arg)
 }
 
+fn vasprintf_l(
+    env: &mut Environment,
+    ret: MutPtr<MutPtr<u8>>,
+    _loc: MutVoidPtr,
+    format: ConstPtr<u8>,
+    arg: VaList,
+) -> i32 {
+    vasprintf(env, ret, format, arg)
+}
+
+fn asprintf_l(
+    env: &mut Environment,
+    ret: MutPtr<MutPtr<u8>>,
+    _loc: MutVoidPtr,
+    format: ConstPtr<u8>,
+    args: DotDotDot,
+) -> i32 {
+    vasprintf(env, ret, format, args.start())
+}
+
+fn sscanf_l(
+    env: &mut Environment,
+    src: ConstPtr<u8>,
+    _loc: MutVoidPtr,
+    format: ConstPtr<u8>,
+    args: DotDotDot,
+) -> i32 {
+    sscanf(env, src, format, args)
+}
+
+fn vsscanf_l(
+    env: &mut Environment,
+    src: ConstPtr<u8>,
+    _loc: MutVoidPtr,
+    format: ConstPtr<u8>,
+    arg: VaList,
+) -> i32 {
+    vsscanf(env, src, format, arg)
+}
+
 fn sprintf(env: &mut Environment, dest: MutPtr<u8>, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
     // errno is cleared optimistically; ISO C does not define errno for
     // the printf family, and error paths set it where it is meaningful.
@@ -2450,6 +2490,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(snprintf_l(_, _, _, _, _)),
     export_c_func!(vsprintf_l(_, _, _, _)),
     export_c_func!(vsnprintf_l(_, _, _, _, _)),
+    export_c_func!(vasprintf_l(_, _, _, _)),
+    export_c_func!(asprintf_l(_, _, _, _)),
+    export_c_func!(sscanf_l(_, _, _, _)),
+    export_c_func!(vsscanf_l(_, _, _, _)),
     export_c_func!(swprintf(_, _, _, _)),
     export_c_func!(vswprintf(_, _, _, _)),
     export_c_func!(wprintf(_, _)),

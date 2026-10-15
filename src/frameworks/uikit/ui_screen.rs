@@ -281,6 +281,52 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (CGPoint)convertPoint:(CGPoint)point fromScreen:(id)_other_screen {
     point
 }
+// MARK: - iOS 8–10 Coordinate Spaces, Trait Collection & Refresh Rate
+
+- (id)coordinateSpace {
+    this
+}
+
+- (id)fixedCoordinateSpace {
+    this
+}
+
+- (id)traitCollection {
+    msg_class![env; UITraitCollection _touchHLE_defaultTraitCollection]
+}
+
+- (crate::frameworks::foundation::NSInteger)maximumFramesPerSecond {
+    60
+}
+
+- (id)focusedView {
+    nil
+}
+
+- (id)focusedItem {
+    nil
+}
+
+- (bool)supportsFocus {
+    false
+}
+
+- (CGRect)convertRect:(CGRect)rect toCoordinateSpace:(id)_space {
+    rect
+}
+
+- (CGRect)convertRect:(CGRect)rect fromCoordinateSpace:(id)_space {
+    rect
+}
+
+- (CGPoint)convertPoint:(CGPoint)point toCoordinateSpace:(id)_space {
+    point
+}
+
+- (CGPoint)convertPoint:(CGPoint)point fromCoordinateSpace:(id)_space {
+    point
+}
+
 // MARK: - Display Link
 
 - (id)displayLinkWithTarget:(id)target selector:(SEL)selector {

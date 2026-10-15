@@ -1664,7 +1664,17 @@ unsafe fn present_renderbuffer_es2(
 ) {
     use crate::gles::gles2_raw as gles2;
 
-    // Save state we are about to clobber
+    // Save state we are about to clobber, including GL_VERTEX_ARRAY_BINDING_OES (0x85B5)
+    // so that our presenter's VertexAttribPointer / EnableVertexAttribArray calls
+    // do not corrupt a VAO bound by the guest (e.g. Minecraft PE 0.15.0).
+    const VERTEX_ARRAY_BINDING_OES: GLenum = 0x85B5;
+    let mut old_vao: GLint = 0;
+    gles.GetIntegerv(VERTEX_ARRAY_BINDING_OES, &mut old_vao);
+    let _ = gles.GetError();
+    if old_vao != 0 {
+        gles.BindVertexArrayOES(0);
+        let _ = gles.GetError();
+    }
     let mut old_program: GLint = 0;
     gles.GetIntegerv(gles2::CURRENT_PROGRAM, &mut old_program);
     let mut old_array_buffer: GLint = 0;
@@ -1898,6 +1908,10 @@ unsafe fn present_renderbuffer_es2(
         if scissor_was_on {
             gles.Enable(gles2::SCISSOR_TEST);
         }
+        if old_vao != 0 {
+            gles.BindVertexArrayOES(old_vao as GLuint);
+            let _ = gles.GetError();
+        }
         return;
     };
 
@@ -1998,6 +2012,10 @@ unsafe fn present_renderbuffer_es2(
     });
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
     gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
+    if old_vao != 0 {
+        gles.BindVertexArrayOES(old_vao as GLuint);
+        let _ = gles.GetError();
+    }
     gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
     gles.ActiveTexture(gles2::TEXTURE0);
     gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);

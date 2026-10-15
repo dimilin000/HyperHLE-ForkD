@@ -86,6 +86,64 @@ fn toupper(env: &mut Environment, c: i32) -> i32 {
     __toupper(env, c)
 }
 
+fn ___tolower_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    __tolower(env, c)
+}
+fn ___toupper_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    __toupper(env, c)
+}
+fn __maskrune_l(env: &mut Environment, rune: i32, mask: u32, _loc: MutVoidPtr) -> i32 {
+    __maskrune(env, rune, mask)
+}
+fn ___mb_cur_max(_env: &mut Environment) -> i32 {
+    1
+}
+fn ___mb_cur_max_l(_env: &mut Environment, _loc: MutVoidPtr) -> i32 {
+    1
+}
+fn isalnum_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isalnum(env, c)
+}
+fn isalpha_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isalpha(env, c)
+}
+fn iscntrl_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    iscntrl(env, c)
+}
+fn isdigit_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isdigit(env, c)
+}
+fn isgraph_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isgraph(env, c)
+}
+fn islower_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    islower(env, c)
+}
+fn ispunct_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    ispunct(env, c)
+}
+fn isspace_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isspace(env, c)
+}
+fn isupper_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isupper(env, c)
+}
+fn isxdigit_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isxdigit(env, c)
+}
+fn isblank_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isblank(env, c)
+}
+fn isprint_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    isprint(env, c)
+}
+fn tolower_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    tolower(env, c)
+}
+fn toupper_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    toupper(env, c)
+}
+
 /// Guest address of the lazily-built `__DefaultRuneLocale` table, so it is
 /// only built (and allocated) once per process instead of on every
 /// `__maskrune()` call or constant lookup.
@@ -239,6 +297,25 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__tolower(_)),
     export_c_func!(__toupper(_)),
     export_c_func!(__maskrune(_, _)),
+    export_c_func!(___tolower_l(_, _)),
+    export_c_func!(___toupper_l(_, _)),
+    export_c_func!(__maskrune_l(_, _, _)),
+    export_c_func!(___mb_cur_max()),
+    export_c_func!(___mb_cur_max_l(_)),
+    export_c_func!(isalnum_l(_, _)),
+    export_c_func!(isalpha_l(_, _)),
+    export_c_func!(iscntrl_l(_, _)),
+    export_c_func!(isdigit_l(_, _)),
+    export_c_func!(isgraph_l(_, _)),
+    export_c_func!(islower_l(_, _)),
+    export_c_func!(ispunct_l(_, _)),
+    export_c_func!(isspace_l(_, _)),
+    export_c_func!(isupper_l(_, _)),
+    export_c_func!(isxdigit_l(_, _)),
+    export_c_func!(isblank_l(_, _)),
+    export_c_func!(isprint_l(_, _)),
+    export_c_func!(tolower_l(_, _)),
+    export_c_func!(toupper_l(_, _)),
 ];
 
 #[cfg(test)]

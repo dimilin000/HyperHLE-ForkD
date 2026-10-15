@@ -336,9 +336,8 @@ fn effective_ios_major_minor(env: &Environment) -> (i32, i32) {
     if let Some((major, minor, _)) = env.options.ios_version {
         return (major, minor);
     }
-    // Default to iOS 7.1 for NSFoundationVersionNumber / kCFCoreFoundationVersionNumber
-    // so iOS 7 games see consistent Foundation/CoreFoundation version numbers.
-    (7, 1)
+    // Default to iOS 10.3 for NSFoundationVersionNumber / kCFCoreFoundationVersionNumber
+    (10, 3)
 }
 
 fn ns_foundation_version_number(env: &mut Environment) -> ConstVoidPtr {
@@ -350,8 +349,10 @@ fn ns_foundation_version_number(env: &mut Environment) -> ConstVoidPtr {
         (6, _) => 993.00,
         (7, 0) => 1047.20,
         (7, _) => 1047.25, // NSFoundationVersionNumber_iOS_7_1
-        (8, _) => 1140.11, // NSFoundationVersionNumber_iOS_8_0
-        _ => 1047.25,
+        (8, _) => 1144.17, // NSFoundationVersionNumber_iOS_8_4
+        (9, _) => 1280.30, // NSFoundationVersionNumber_iOS_9_x
+        (10, _) => 1349.1, // NSFoundationVersionNumber_iOS_10_x
+        _ => 1349.1,
     };
     let ptr: MutPtr<u64> = env.mem.alloc(8).cast();
     env.mem.write(ptr, version.to_bits());
@@ -367,9 +368,11 @@ fn cf_core_foundation_version_number(env: &mut Environment) -> ConstVoidPtr {
         (5, _) => 675.00,
         (6, _) => 793.00,
         (7, 0) => 847.20,
-        (7, _) => 847.24, // kCFCoreFoundationVersionNumber_iOS_7_1
-        (8, _) => 1140.10,
-        _ => 847.24,
+        (7, _) => 847.24,  // kCFCoreFoundationVersionNumber_iOS_7_1
+        (8, _) => 1145.15, // kCFCoreFoundationVersionNumber_iOS_8_4
+        (9, _) => 1280.30, // kCFCoreFoundationVersionNumber_iOS_9_x
+        (10, _) => 1348.22, // kCFCoreFoundationVersionNumber_iOS_10_x
+        _ => 1348.22,
     };
     let ptr: MutPtr<u64> = env.mem.alloc(8).cast();
     env.mem.write(ptr, version.to_bits());

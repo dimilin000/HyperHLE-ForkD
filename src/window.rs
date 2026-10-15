@@ -267,21 +267,20 @@ impl DeviceFamily {
             | DeviceFamily::iPhone4
             | DeviceFamily::iPad
             | DeviceFamily::iPodTouch4 => 256 * MIB,
-            // iPhone 4S / 5 / 5c, iPad 2/3/4/mini, iPod touch 5 shipped with
-            // 512 MiB.
+            // iPhone 4S, iPad 2, iPad mini (1st gen), iPod touch 5 shipped with 512 MiB.
             DeviceFamily::iPhone4s
-            | DeviceFamily::iPhone5
-            | DeviceFamily::iPhone5c
             | DeviceFamily::iPad2
-            | DeviceFamily::iPad3
-            | DeviceFamily::iPad4
             | DeviceFamily::iPadMini
             | DeviceFamily::iPodTouch5 => 512 * MIB,
-            // iPad 5 (2017) and the Retina iPad minis shipped with 1 GiB. We
-            // intentionally cap this at 1 GiB even though the address space is
-            // 4 GiB, leaving headroom for the guest heap, stacks and mapped
-            // libraries.
-            DeviceFamily::iPad5 | DeviceFamily::iPadMini2 | DeviceFamily::iPadMini3 => 1024 * MIB,
+            // iPhone 5 (A6), iPhone 5c (A6), iPad 3 (A5X), iPad 4 (A6X), iPad 5,
+            // and Retina iPad minis shipped with 1 GiB of RAM.
+            DeviceFamily::iPhone5
+            | DeviceFamily::iPhone5c
+            | DeviceFamily::iPad3
+            | DeviceFamily::iPad4
+            | DeviceFamily::iPad5
+            | DeviceFamily::iPadMini2
+            | DeviceFamily::iPadMini3 => 1024 * MIB,
         }
     }
 

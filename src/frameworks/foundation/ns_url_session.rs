@@ -502,6 +502,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     make_task(env, this, request, handler)
 }
 
+- (id)uploadTaskWithRequest:(id)request fromData:(id)_data {
+    make_task(env, this, request, nil)
+}
+- (id)uploadTaskWithRequest:(id)request fromData:(id)_data completionHandler:(id)handler {
+    make_task(env, this, request, handler)
+}
+- (id)uploadTaskWithRequest:(id)request fromFile:(id)_file_url {
+    make_task(env, this, request, nil)
+}
+- (id)uploadTaskWithRequest:(id)request fromFile:(id)_file_url completionHandler:(id)handler {
+    make_task(env, this, request, handler)
+}
+- (id)uploadTaskWithStreamedRequest:(id)request {
+    make_task(env, this, request, nil)
+}
+- (id)downloadTaskWithResumeData:(id)_resume_data {
+    make_task(env, this, nil, nil)
+}
+- (id)downloadTaskWithResumeData:(id)_resume_data completionHandler:(id)handler {
+    make_task(env, this, nil, handler)
+}
+- (())getTasksWithCompletionHandler:(id)_handler { }
+- (())getAllTasksWithCompletionHandler:(id)_handler { }
+- (())resetWithCompletionHandler:(id)_handler { }
+- (())flushWithCompletionHandler:(id)_handler { }
+
 // MARK: - Lifecycle
 
 - (())finishTasksAndInvalidate {
@@ -556,11 +582,39 @@ pub const CLASSES: ClassExports = objc_classes! {
         .borrow_mut::<NSURLSessionTaskHostObject>(this)
         .state = NS_URL_SESSION_TASK_STATE_RUNNING;
     log!(
-        "NSURLSessionTask resume: delivering NSURLErrorNotConnectedToInternet \
+        "NSURLSessionTask resume: scheduling async NSURLErrorNotConnectedToInternet \
          (touchHLE has no network)"
     );
+    let sel = env
+        .objc
+        .lookup_selector("_touchHLE_deliverFailure:")
+        .unwrap();
+    let _: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:0.001f64
+                                                                target:this
+                                                              selector:sel
+                                                              userInfo:nil
+                                                               repeats:false];
+}
+
+- (())_touchHLE_deliverFailure:(id)_timer {
+    let state = env
+        .objc
+        .borrow::<NSURLSessionTaskHostObject>(this)
+        .state;
+    if state == NS_URL_SESSION_TASK_STATE_COMPLETED {
+        return;
+    }
     deliver_task_failure(env, this);
 }
+
+- (f32)priority { 0.5 }
+- (())setPriority:(f32)_p { }
+- (id)taskDescription { nil }
+- (())setTaskDescription:(id)_desc { }
+- (i64)countOfBytesReceived { 0 }
+- (i64)countOfBytesSent { 0 }
+- (i64)countOfBytesExpectedToSend { 0 }
+- (i64)countOfBytesExpectedToReceive { 0 }
 
 - (())suspend {
     let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(this);
