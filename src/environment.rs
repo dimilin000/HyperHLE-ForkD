@@ -803,6 +803,7 @@ impl Environment {
             .unwrap();
 
         let entry_point_is_lc_main = executable.entry_point_is_lc_main;
+        let executable_is_arm64 = executable.is_arm64;
 
         let entry_point_addr = abi::GuestFunction::from_addr_with_thumb_bit(entry_point_addr);
 
@@ -816,10 +817,13 @@ impl Environment {
         let mut dyld = dyld::Dyld::new();
         dyld.do_initial_linking(&bundle, &bins, &mut mem, &mut objc);
 
-        let cpu = cpu::Cpu::new(match options.direct_memory_access {
+        let mut cpu = cpu::Cpu::new(match options.direct_memory_access {
             true => Some(&mut mem),
             false => None,
         });
+        if executable_is_arm64 {
+            cpu.enable_arm64();
+        }
 
         // XaView BypassStackOverflow: guest code runs on this coroutine stack.
         // The 1MB corosensei default is too small for deeply-nested guest -> host
@@ -838,6 +842,9 @@ impl Environment {
                         // will try to poke the top of the stack, so we'll give
                         // it some room.
                         env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
+                        if let Some(arm64) = env.cpu.arm64_mut() {
+                            arm64.sp = 0xFFFFF000;
+                        }
 
                         // Call `+load` method on classes where it's defined.
                         // TODO: `+load` methods from our image should take priority
@@ -904,20 +911,24 @@ impl Environment {
                             };
 
                             log_dbg!("Calling static initializers for {:?}", bin.name);
-                            assert!(section.size % 4 == 0);
-
-                            let base: mem::ConstPtr<abi::GuestFunction> =
-                                mem::Ptr::from_bits(section.addr);
-
-                            let count = section.size / 4;
+                            let is_bin_arm64 = bin.is_arm64;
+                            let ptr_stride = if is_bin_arm64 { 8 } else { 4 };
+                            assert!(section.size % ptr_stride == 0);
+                            let section_addr = section.addr;
+                            let count = section.size / ptr_stride;
                             for i in 0..count {
-                                let func = env.mem.read(base + i);
+                                let func: abi::GuestFunction = if is_bin_arm64 {
+                                    let raw: u64 = env
+                                        .mem
+                                        .read(mem::Ptr::from_bits(section_addr + i * 8));
+                                    abi::GuestFunction::from_addr_with_thumb_bit(raw as u32)
+                                } else {
+                                    let base: mem::ConstPtr<abi::GuestFunction> =
+                                        mem::Ptr::from_bits(section_addr);
+                                    env.mem.read(base + i)
+                                };
 
-                                log_dbg!(
-                                    "Calling static initializer at {:?} from {:?}",
-                                    func,
-                                    (base + i)
-                                );
+                                log_dbg!("Calling static initializer at {:?}", func);
 
                                 () = func.call_from_host(env, ());
                             }

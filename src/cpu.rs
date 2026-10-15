@@ -5,11 +5,11 @@
  */
 //! CPU emulation.
 //!
-//! Implemented using the C++ library dynarmic, which is a dynamic recompiler.
-//!
-//! iPhone OS apps used either ARMv6 or ARMv7-A, which are both 32-bit ISAs.
-//! For the moment, only ARMv6 has been tested.
+//! Implemented using the C++ library dynarmic (for 32-bit ARMv6/ARMv7-A) and
+//! the built-in 64-bit ARMv8-A (`AArch64`) interpreter (`arm64`).
 // KlugKlugTG was here!
+pub mod arm64;
+
 use crate::abi::GuestFunction;
 use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
 
@@ -17,7 +17,31 @@ use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
 use touchHLE_dynarmic_wrapper::*;
 
 type VAddr = u32;
-pub type CpuContext = touchHLE_DynarmicContext;
+
+#[derive(Default)]
+pub struct CpuContext {
+    dynarmic: touchHLE_DynarmicContext,
+    arm64: Option<Box<arm64::Arm64Cpu>>,
+}
+
+impl CpuContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for CpuContext {
+    type Target = touchHLE_DynarmicContext;
+    fn deref(&self) -> &Self::Target {
+        &self.dynarmic
+    }
+}
+
+impl std::ops::DerefMut for CpuContext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.dynarmic
+    }
+}
 
 fn touchHLE_cpu_read_impl<T: SafeRead + Default>(
     mem: *mut touchHLE_Mem,
@@ -106,6 +130,8 @@ pub struct Cpu {
     /// Copy of the direct memory access pointer used to check it has not
     /// changed. If this is null, direct memory access is not in use.
     direct_memory_access_ptr: *const std::ffi::c_void,
+    /// Present when running a 64-bit (`CPU_TYPE_ARM64`) guest binary.
+    arm64: Option<Box<arm64::Arm64Cpu>>,
 }
 
 impl Drop for Cpu {
@@ -177,7 +203,26 @@ impl Cpu {
         Cpu {
             dynarmic_wrapper,
             direct_memory_access_ptr,
+            arm64: None,
         }
+    }
+
+    pub fn enable_arm64(&mut self) {
+        if self.arm64.is_none() {
+            self.arm64 = Some(Box::new(arm64::Arm64Cpu::new()));
+        }
+    }
+
+    pub fn is_arm64(&self) -> bool {
+        self.arm64.is_some()
+    }
+
+    pub fn arm64(&self) -> Option<&arm64::Arm64Cpu> {
+        self.arm64.as_deref()
+    }
+
+    pub fn arm64_mut(&mut self) -> Option<&mut arm64::Arm64Cpu> {
+        self.arm64.as_deref_mut()
     }
 
     pub fn regs(&self) -> &[u32; 16] {
@@ -243,18 +288,32 @@ impl Cpu {
     /// Only meaningful immediately after [Self::run_or_step] returned one of
     /// the errors above; the value is stale at any other time.
     pub fn last_exception_pc(&self) -> VAddr {
+        if let Some(arm64) = self.arm64.as_ref() {
+            return arm64.last_exception_pc;
+        }
         unsafe { touchHLE_DynarmicWrapper_last_exception_pc(self.dynarmic_wrapper) }
     }
 
     /// Swap the current state of the CPU (registers etc) with the state stored
     /// in the context object.
     pub fn swap_context(&mut self, context: &mut CpuContext) {
-        unsafe { touchHLE_DynarmicWrapper_swap_context(self.dynarmic_wrapper, context) }
+        unsafe {
+            touchHLE_DynarmicWrapper_swap_context(self.dynarmic_wrapper, &mut context.dynarmic)
+        }
+        if self.arm64.is_some() || context.arm64.is_some() {
+            if context.arm64.is_none() {
+                context.arm64 = Some(Box::new(arm64::Arm64Cpu::new()));
+            }
+            std::mem::swap(&mut self.arm64, &mut context.arm64);
+        }
     }
 
     /// Get PC with the Thumb bit appropriately set.
     pub fn pc_with_thumb_bit(&self) -> GuestFunction {
         let pc = self.regs()[Self::PC];
+        if self.arm64.is_some() {
+            return GuestFunction::from_addr_and_thumb_flag(pc & !1, false);
+        }
         let thumb = (self.cpsr() & Self::CPSR_THUMB) == Self::CPSR_THUMB;
         GuestFunction::from_addr_and_thumb_flag(pc, thumb)
     }
@@ -262,6 +321,14 @@ impl Cpu {
     /// Set PC and the Thumb flag for executing a guest function. Note that this
     /// does not touch LR.
     pub fn branch(&mut self, new_pc: GuestFunction) {
+        if self.arm64.is_some() {
+            let addr = new_pc.addr_without_thumb_bit();
+            self.regs_mut()[Self::PC] = addr;
+            if let Some(arm64) = self.arm64.as_mut() {
+                arm64.pc = addr as u64;
+            }
+            return;
+        }
         self.regs_mut()[Self::PC] = new_pc.addr_without_thumb_bit();
         let cpsr_without_thumb = self.cpsr() & (!Self::CPSR_THUMB);
         self.set_cpsr(cpsr_without_thumb | ((new_pc.is_thumb() as u32) * Self::CPSR_THUMB))
@@ -278,6 +345,9 @@ impl Cpu {
         let old_lr = GuestFunction::from_addr_with_thumb_bit(self.regs()[Self::LR]);
         self.branch(new_pc);
         self.regs_mut()[Self::LR] = new_lr.addr_with_thumb_bit();
+        if let Some(arm64) = self.arm64.as_mut() {
+            arm64.x[30] = new_lr.addr_without_thumb_bit() as u64;
+        }
         (old_pc, old_lr)
     }
 
@@ -285,6 +355,9 @@ impl Cpu {
     /// This is of interest to the dynamic linker, which will sometimes rewrite
     /// code.
     pub fn invalidate_cache_range(&mut self, base: VAddr, size: GuestUSize) {
+        if self.arm64.is_some() {
+            return;
+        }
         unsafe {
             touchHLE_DynarmicWrapper_invalidate_cache_range(self.dynarmic_wrapper, base, size)
         }
@@ -305,6 +378,18 @@ impl Cpu {
         // See ::new() for why this is done.
         if !self.direct_memory_access_ptr.is_null() {
             assert!(self.direct_memory_access_ptr == unsafe { mem.direct_memory_access_ptr() });
+        }
+
+        if self.arm64.is_some() {
+            let regs_mut = unsafe {
+                let ptr = touchHLE_DynarmicWrapper_regs_mut(self.dynarmic_wrapper);
+                &mut *(ptr as *mut [u32; 16])
+            };
+            return self
+                .arm64
+                .as_mut()
+                .unwrap()
+                .run_or_step(mem, ticks, regs_mut);
         }
 
         let res = unsafe {

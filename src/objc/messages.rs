@@ -2447,9 +2447,18 @@ pub(super) fn objc_msgSendSuper2(
     super_ptr: ConstPtr<objc_super>,
     selector: SEL,
 ) {
-    let objc_super { receiver, class } = env.mem.read(super_ptr);
+    let objc_super {
+        receiver,
+        mut class,
+    } = env.mem.read(super_ptr);
+    if env.cpu.is_arm64() && class == nil {
+        class = env.mem.read(Ptr::from_bits(super_ptr.to_bits() + 8));
+    }
     // Rewrite first argument to match the normal ABI.
     crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
+    if let Some(arm64) = env.cpu.arm64_mut() {
+        arm64.x[0] = receiver.to_bits() as u64;
+    }
     objc_msgSend_inner(
         env,
         receiver,
@@ -2468,9 +2477,18 @@ pub(super) fn objc_msgSendSuper2_stret(
     super_ptr: ConstPtr<objc_super>,
     selector: SEL,
 ) {
-    let objc_super { receiver, class } = env.mem.read(super_ptr);
+    let objc_super {
+        receiver,
+        mut class,
+    } = env.mem.read(super_ptr);
+    if env.cpu.is_arm64() && class == nil {
+        class = env.mem.read(Ptr::from_bits(super_ptr.to_bits() + 8));
+    }
     // Rewrite second argument (r1) to match the normal stret ABI (r0 = stret, r1 = receiver, r2 = selector).
     env.cpu.regs_mut()[1] = receiver.to_bits();
+    if let Some(arm64) = env.cpu.arm64_mut() {
+        arm64.x[1] = receiver.to_bits() as u64;
+    }
     objc_msgSend_inner(
         env,
         receiver,

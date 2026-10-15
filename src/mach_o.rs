@@ -34,6 +34,22 @@ const VM_PROT_WRITE: vm_prot_t = 2;
 #[allow(dead_code)]
 const VM_PROT_EXECUTE: vm_prot_t = 4;
 
+/// `CPU_TYPE_ARM64` (`CPU_TYPE_ARM | CPU_ARCH_ABI64` = `0x0100_000c`).
+const CPU_TYPE_ARM64: i32 = mach_object::CPU_TYPE_ARM | 0x0100_0000;
+/// Default `__TEXT` base of 64-bit iOS executables (`0x1_0000_0000`).
+const ARM64_DEFAULT_TEXT_BASE: u64 = 0x1_0000_0000;
+/// Rebased `__TEXT` base inside `< 4 GiB` `Mem` (`0x0010_0000`).
+const ARM64_REBASED_TEXT_BASE: u32 = 0x0010_0000;
+
+#[inline]
+fn rebase_arm64_addr(addr: u64) -> u32 {
+    if addr >= ARM64_DEFAULT_TEXT_BASE {
+        ((addr - ARM64_DEFAULT_TEXT_BASE) as u32).wrapping_add(ARM64_REBASED_TEXT_BASE)
+    } else {
+        addr as u32
+    }
+}
+
 #[derive(Debug)]
 pub struct MachO {
     /// Name (for debugging purposes and sorting)
@@ -68,6 +84,8 @@ pub struct MachO {
     /// Base address of the __TEXT segment (where the mach_header lives in
     /// memory). Used by `_dyld_get_image_header`.
     pub text_base: u32,
+    /// True if this image is a 64-bit `CPU_TYPE_ARM64` binary.
+    pub is_arm64: bool,
 }
 
 #[derive(Debug)]
@@ -146,7 +164,8 @@ fn get_sym_by_idx<'a>(
         return None;
     }
 
-    let symoff = (symoff + idx * 12) as u64;
+    let nlist_size = if is_64bit { 16 } else { 12 };
+    let symoff = (symoff + idx * nlist_size) as u64;
 
     cursor.seek(SeekFrom::Start(symoff)).unwrap();
 
@@ -366,7 +385,7 @@ impl MachO {
                 let mut best_subslice: Option<&[u8]> = None;
                 let mut best_priority = None;
                 let mut had_invalid_slice = false;
-                for (arch, _) in files {
+                for (arch, _) in &files {
                     if arch.cputype != mach_object::CPU_TYPE_ARM {
                         continue;
                     }
@@ -433,6 +452,41 @@ impl MachO {
                         best_priority = Some(priority);
                     }
                 }
+                // Fallback: if no 32-bit ARM slice is present in the FAT binary,
+                // look for a valid 64-bit `CPU_TYPE_ARM64` slice.
+                if best_subslice.is_none() {
+                    for (arch, _) in &files {
+                        if arch.cputype != CPU_TYPE_ARM64 {
+                            continue;
+                        }
+                        let off = arch.offset as usize;
+                        let size = arch.size as usize;
+                        let Some(end) = off.checked_add(size) else {
+                            had_invalid_slice = true;
+                            continue;
+                        };
+                        if end > bytes.len() {
+                            had_invalid_slice = true;
+                            continue;
+                        }
+                        let subslice = &bytes[off..end];
+                        let usable = match OFile::parse(&mut Cursor::new(subslice)) {
+                            Ok(OFile::MachFile { header, commands }) => {
+                                header.cputype == CPU_TYPE_ARM64
+                                    && header.is_64bit()
+                                    && !header.is_bigend()
+                                    && validate_segment_ranges(&commands, subslice.len()).is_ok()
+                            }
+                            _ => false,
+                        };
+                        if usable {
+                            best_subslice = Some(subslice);
+                            break;
+                        } else {
+                            had_invalid_slice = true;
+                        }
+                    }
+                }
                 return if let Some(subslice) = best_subslice {
                     MachO::load_from_bytes(subslice, into_mem, name, slide_to_address)
                 } else if had_invalid_slice {
@@ -446,7 +500,8 @@ impl MachO {
             }
         };
 
-        if header.cputype != mach_object::CPU_TYPE_ARM {
+        let is_arm64 = header.cputype == CPU_TYPE_ARM64;
+        if header.cputype != mach_object::CPU_TYPE_ARM && !is_arm64 {
             return Err("Executable is not for an ARM CPU!");
         }
 
@@ -455,10 +510,10 @@ impl MachO {
             return Err("Executable is not little-endian!");
         }
         let is_64bit = header.is_64bit();
-        if is_64bit {
+        if is_64bit != is_arm64 {
             return Err("Executable is not 32-bit!");
         }
-        if arm_subtype_priority(header.cpusubtype).is_none() {
+        if !is_arm64 && arm_subtype_priority(header.cpusubtype).is_none() {
             log!(
                 "Rejecting {:?}: unsupported ARM CPU subtype {:#x}",
                 name,
@@ -467,11 +522,15 @@ impl MachO {
             return Err("Unsupported ARM CPU subtype or capabilities (expected ARM_ALL, ARMv6, ARMv7, ARMv7f or ARMv7s)");
         }
 
-        log!(
-            "Loading {} slice for {:?}",
-            cpu_subtype_to_str(header.cpusubtype),
-            name
-        );
+        if is_arm64 {
+            log!("Loading arm64 (64-bit ARMv8) slice for {:?}", name);
+        } else {
+            log!(
+                "Loading {} slice for {:?}",
+                cpu_subtype_to_str(header.cpusubtype),
+                name
+            );
+        }
 
         // Do not mutate guest memory until every file-backed segment, including
         // __LINKEDIT, is known to fit the selected thin image.
@@ -511,8 +570,16 @@ impl MachO {
                     sections,
                     ..
                 } => {
-                    let vmaddr: u32 = vmaddr.try_into().unwrap();
-                    let vmsize: u32 = vmsize.try_into().unwrap();
+                    let vmaddr: u32 = if is_64bit {
+                        rebase_arm64_addr(vmaddr as u64)
+                    } else {
+                        vmaddr.try_into().unwrap()
+                    };
+                    let vmsize: u32 = if is_64bit && &*segname == "__PAGEZERO" {
+                        0x4000
+                    } else {
+                        vmsize.try_into().unwrap()
+                    };
                     let filesize: u32 = filesize.try_into().unwrap();
 
                     if first_segment_base.is_none() {
@@ -540,7 +607,8 @@ impl MachO {
                             text_segment_base = Some(vmaddr + slide);
                             true
                         }
-                        "__DATA" => true,
+                        "__DATA" | "__DATA_CONST" | "__DATA_DIRTY" | "__OBJC_CONST"
+                        | "__AUTH" | "__AUTH_CONST" => true,
                         // `__RESTRICT` is a one-section segment Apple's
                         // linker emits to mark a binary as non-injectable
                         // (it disables `DYLD_INSERT_LIBRARIES` and the
@@ -608,6 +676,19 @@ impl MachO {
                             let dst =
                                 into_mem.bytes_at_mut(Ptr::from_bits(vmaddr + slide), filesize);
                             dst.copy_from_slice(src);
+                            if is_64bit && &*segname != "__TEXT" {
+                                for chunk in dst.chunks_exact_mut(8) {
+                                    let raw = u64::from_le_bytes(chunk.try_into().unwrap());
+                                    let low48 = raw & 0x0000_ffff_ffff_ffff;
+                                    if low48 >= ARM64_DEFAULT_TEXT_BASE
+                                        && low48 < ARM64_DEFAULT_TEXT_BASE + 0x4000_0000
+                                    {
+                                        let rebased =
+                                            (rebase_arm64_addr(low48).wrapping_add(slide)) as u64;
+                                        chunk.copy_from_slice(&rebased.to_le_bytes());
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -645,8 +726,12 @@ impl MachO {
                                 ..
                             } = symbol
                             {
-                                let entry: u32 = entry.try_into().unwrap();
-                                let entry = if desc & N_ARM_THUMB_DEF != 0 {
+                                let entry: u32 = if is_64bit {
+                                    rebase_arm64_addr(entry as u64)
+                                } else {
+                                    entry.try_into().unwrap()
+                                };
+                                let entry = if !is_64bit && (desc & N_ARM_THUMB_DEF != 0) {
                                     entry | GuestFunction::THUMB_BIT
                                 } else {
                                     entry
@@ -751,7 +836,7 @@ impl MachO {
                             addr,
                             sym_idx,
                             is_pc_relative: false,
-                            size: 4,
+                            size,
                             type_: 0, // generic
                         } = reloc
                         else {
@@ -761,6 +846,13 @@ impl MachO {
                             );
                             continue;
                         };
+                        if size != 4 && !(is_64bit && size == 8) {
+                            log!(
+                                "Warning: skipping unsupported external relocation size: {:?}",
+                                reloc
+                            );
+                            continue;
+                        }
                         let addr = if split_segs {
                             addr + first_read_write_segment_base.unwrap()
                         } else {
@@ -786,19 +878,35 @@ impl MachO {
                                 //
                                 // Resolve them immediately, there is no value
                                 // in passing these on to Dyld.
-                                let addr = Ptr::from_bits(addr);
-                                let addend: u32 = into_mem.read(addr);
-                                let entry = (entry as u32).wrapping_add(slide);
-                                let entry = if desc & N_ARM_THUMB_DEF != 0 {
-                                    entry | GuestFunction::THUMB_BIT
+                                let entry = if is_64bit {
+                                    rebase_arm64_addr(entry as u64).wrapping_add(slide)
                                 } else {
-                                    entry
+                                    let e = (entry as u32).wrapping_add(slide);
+                                    if desc & N_ARM_THUMB_DEF != 0 {
+                                        e | GuestFunction::THUMB_BIT
+                                    } else {
+                                        e
+                                    }
                                 };
-                                into_mem.write(addr, entry.wrapping_add(addend));
+                                if is_64bit && size == 8 {
+                                    let addr_ptr: MutPtr<u64> = Ptr::from_bits(addr);
+                                    let addend: u64 = into_mem.read(addr_ptr);
+                                    let addend_low = (addend & 0xffff_ffff) as u32;
+                                    into_mem.write(addr_ptr, (entry.wrapping_add(addend_low)) as u64);
+                                } else {
+                                    let addr_ptr = Ptr::from_bits(addr);
+                                    let addend: u32 = into_mem.read(addr_ptr);
+                                    into_mem.write(addr_ptr, entry.wrapping_add(addend));
+                                }
                             }
                             Some(Symbol::Prebound { name: Some(n), .. }) => {
-                                let ptr_ptr = Ptr::<u32, true>::from_bits(addr);
-                                into_mem.write(ptr_ptr, 0); // Clear prebinding.
+                                if is_64bit && size == 8 {
+                                    let ptr_ptr = Ptr::<u64, true>::from_bits(addr);
+                                    into_mem.write(ptr_ptr, 0);
+                                } else {
+                                    let ptr_ptr = Ptr::<u32, true>::from_bits(addr);
+                                    into_mem.write(ptr_ptr, 0); // Clear prebinding.
+                                }
                                 external_relocations.push((addr, String::from(n)));
                             }
                             other => {
@@ -940,6 +1048,8 @@ impl MachO {
                         &bytes[off_usize..end]
                     }
 
+                    let ptr_size = if is_64bit { 8 } else { size_of::<GuestUSize>() };
+
                     let rebase_opcodes = Rebase::parse(
                         checked_dyld_info_slice(
                             bytes,
@@ -948,24 +1058,46 @@ impl MachO {
                             "rebase",
                             &name,
                         ),
-                        size_of::<GuestUSize>(),
+                        ptr_size,
                     );
 
                     for symb in rebase_opcodes {
                         match symb.symbol_type {
                             BindSymbolType::Pointer => {
-                                let addr = segment_offsets[symb.segment_index]
+                                let Some(&seg_base) = segment_offsets.get(symb.segment_index)
+                                else {
+                                    continue;
+                                };
+                                let addr = seg_base
                                     + symb.symbol_offset as u32
                                     + slide;
-                                let original_location = Ptr::from_bits(addr);
-                                let old: u32 = into_mem.read(original_location);
-                                log_dbg!(
-                                    "Pointer rebase at {:#x} from {:#x} to {:#x}",
-                                    addr,
-                                    old,
-                                    old + slide
-                                );
-                                into_mem.write(original_location, old + slide);
+                                if is_64bit {
+                                    let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
+                                    let old64: u64 = into_mem.read(ptr64);
+                                    let low48 = old64 & 0x0000_ffff_ffff_ffff;
+                                    let new64 = if low48 >= ARM64_DEFAULT_TEXT_BASE
+                                        && low48 < ARM64_DEFAULT_TEXT_BASE + 0x4000_0000
+                                    {
+                                        (rebase_arm64_addr(low48).wrapping_add(slide)) as u64
+                                    } else if low48 < ARM64_REBASED_TEXT_BASE as u64 && low48 != 0 {
+                                        (ARM64_REBASED_TEXT_BASE
+                                            .wrapping_add(low48 as u32)
+                                            .wrapping_add(slide)) as u64
+                                    } else {
+                                        old64
+                                    };
+                                    into_mem.write(ptr64, new64);
+                                } else {
+                                    let original_location = Ptr::from_bits(addr);
+                                    let old: u32 = into_mem.read(original_location);
+                                    log_dbg!(
+                                        "Pointer rebase at {:#x} from {:#x} to {:#x}",
+                                        addr,
+                                        old,
+                                        old + slide
+                                    );
+                                    into_mem.write(original_location, old + slide);
+                                }
                             }
                             other => {
                                 log!(
@@ -984,15 +1116,23 @@ impl MachO {
                             "bind",
                             &name,
                         ),
-                        size_of::<GuestUSize>(),
+                        ptr_size,
                     );
                     for symb in bind_opcodes {
                         match symb.symbol_type {
                             BindSymbolType::Pointer => {
-                                let addr = segment_offsets[symb.segment_index]
+                                let Some(&seg_base) = segment_offsets.get(symb.segment_index)
+                                else {
+                                    continue;
+                                };
+                                let addr = seg_base
                                     + symb.symbol_offset as u32
                                     + slide;
-                                if symb.addend != 0 {
+                                if is_64bit {
+                                    let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
+                                    let addend_u64 = (symb.addend as i32 as u32) as u64;
+                                    into_mem.write(ptr64, addend_u64);
+                                } else if symb.addend != 0 {
                                     let ptr: MutPtr<u32> = Ptr::from_bits(addr);
                                     if into_mem.read(ptr) == 0 {
                                         into_mem.write(ptr, symb.addend as i32 as u32);
@@ -1019,7 +1159,7 @@ impl MachO {
                                 "weak_bind",
                                 &name,
                             ),
-                            size_of::<GuestUSize>(),
+                            ptr_size,
                         );
                         for symb in weak_bind_opcodes {
                             if matches!(symb.symbol_type, BindSymbolType::Pointer) {
@@ -1027,12 +1167,25 @@ impl MachO {
                                     let addr = segment_offsets[symb.segment_index]
                                         + symb.symbol_offset as u32
                                         + slide;
-                                    let ptr: MutPtr<u32> = Ptr::from_bits(addr);
-                                    if into_mem.read(ptr) == 0 {
-                                        if symb.addend != 0 {
-                                            into_mem.write(ptr, symb.addend as i32 as u32);
+                                    if is_64bit {
+                                        let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
+                                        if into_mem.read(ptr64) == 0 {
+                                            if symb.addend != 0 {
+                                                into_mem.write(
+                                                    ptr64,
+                                                    (symb.addend as i32 as u32) as u64,
+                                                );
+                                            }
+                                            external_relocations.push((addr, symb.name));
                                         }
-                                        external_relocations.push((addr, symb.name));
+                                    } else {
+                                        let ptr: MutPtr<u32> = Ptr::from_bits(addr);
+                                        if into_mem.read(ptr) == 0 {
+                                            if symb.addend != 0 {
+                                                into_mem.write(ptr, symb.addend as i32 as u32);
+                                            }
+                                            external_relocations.push((addr, symb.name));
+                                        }
                                     }
                                 }
                             }
@@ -1043,13 +1196,28 @@ impl MachO {
             }
         }
 
+        if entry_point_pc.is_none() && is_arm64 {
+            if let Some(&main_pc) = exported_symbols
+                .get("_main")
+                .or_else(|| exported_symbols.get("start"))
+            {
+                entry_point_pc = Some(main_pc);
+                entry_point_is_lc_main = true;
+            }
+        }
+
         let sections = all_sections
             .iter()
             .map(|section| {
                 let section = &**section;
 
                 let name = section.sectname.clone();
-                let addr: u32 = TryInto::<u32>::try_into(section.addr).unwrap() + slide;
+                let raw_addr: u32 = if is_64bit {
+                    rebase_arm64_addr(section.addr as u64)
+                } else {
+                    TryInto::<u32>::try_into(section.addr).unwrap()
+                };
+                let addr: u32 = raw_addr + slide;
                 let size: u32 = section.size.try_into().unwrap();
                 let type_ = section.flags.sect_type();
 
@@ -1061,15 +1229,16 @@ impl MachO {
                     type_,
                 );
 
+                let ptr_size: u32 = if is_64bit { 8 } else { 4 };
                 use SectionType as ST;
                 let (type_, dyld_entry_size) = match type_ {
                     S_MOD_INIT_FUNC_POINTERS => (ST::ModInitFuncPointers, None),
                     // Symbol stub sections have a variable size depending on
                     // whether PIC is in use.
                     S_SYMBOL_STUBS => (ST::SymbolStubs, Some(section.reserved2)),
-                    // 4 bytes per pointer
-                    S_LAZY_SYMBOL_POINTERS => (ST::LazySymbolPointers, Some(4)),
-                    S_NON_LAZY_SYMBOL_POINTERS => (ST::NonLazySymbolPointers, Some(4)),
+                    // 4 bytes per pointer (8 bytes on arm64)
+                    S_LAZY_SYMBOL_POINTERS => (ST::LazySymbolPointers, Some(ptr_size)),
+                    S_NON_LAZY_SYMBOL_POINTERS => (ST::NonLazySymbolPointers, Some(ptr_size)),
                     _ => (ST::Normal, None),
                 };
                 let dyld_indirect_symbol_info = dyld_entry_size.and_then(|entry_size| {
@@ -1131,6 +1300,7 @@ impl MachO {
             entry_point_is_lc_main,
             last_segment_end,
             text_base: text_segment_base.unwrap_or(first_segment_base.unwrap_or(0)),
+            is_arm64,
         })
     }
 

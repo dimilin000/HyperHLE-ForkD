@@ -811,6 +811,9 @@ impl Dyld {
     /// These stubs already exist in the binary, but they need to be rewritten
     /// so that they will invoke our dynamic linker.
     fn setup_lazy_linking(&self, bin: &MachO, mem: &mut Mem) {
+        if bin.is_arm64 {
+            return;
+        }
         for stubs in bin
             .sections
             .iter()
@@ -1277,10 +1280,15 @@ impl Dyld {
             };
             // wrapping_add() is used in case the offset is negative. I haven't
             // seen it happen, but it would make sense if that is allowed.
-            mem.write(
-                ptr_ptr,
-                Ptr::from_bits(target.to_bits().wrapping_add(offset)),
-            )
+            let resolved = target.to_bits().wrapping_add(offset);
+            if bin.is_arm64 {
+                mem.write(
+                    Ptr::<u64, true>::from_bits(ptr_ptr.to_bits()),
+                    resolved as u64,
+                );
+            } else {
+                mem.write(ptr_ptr, Ptr::from_bits(resolved));
+            }
         }
         // Collecting unhandled relocations for the same symbol onto one line
         // makes the log output much less spammy.
@@ -1308,9 +1316,19 @@ impl Dyld {
             };
 
             let entry_size = info.entry_size;
-            if entry_size != 4 || ptrs.size % entry_size != 0 {
+            if (entry_size != 4 && entry_size != 8) || ptrs.size % entry_size != 0 {
                 continue;
             }
+            let write_ptr_slot = |mem: &mut Mem, slot: MutPtr<ConstVoidPtr>, val: ConstVoidPtr| {
+                if entry_size == 8 {
+                    mem.write(
+                        Ptr::<u64, true>::from_bits(slot.to_bits()),
+                        val.to_bits() as u64,
+                    );
+                } else {
+                    mem.write(slot, val);
+                }
+            };
             let ptr_count = ptrs.size / entry_size;
             'ptr_loop: for i in 0..ptr_count {
             let Some(symbol) = info.indirect_undef_symbols[i as usize].as_deref() else {
@@ -1325,7 +1343,7 @@ impl Dyld {
                         addr,
                         &mut self.cxxabi_typeinfo_vtable_kinds,
                     );
-                    mem.write(ptr_ptr, Ptr::from_bits(addr));
+                    write_ptr_slot(mem, ptr_ptr, Ptr::from_bits(addr));
                     continue 'ptr_loop;
                 }
             }
@@ -1337,7 +1355,7 @@ impl Dyld {
                     .create_proc_address_no_inval(mem, symbol)
                     .unwrap()
                     .to_ptr();
-                mem.write(ptr_ptr, trampoline_ptr);
+                write_ptr_slot(mem, ptr_ptr, trampoline_ptr);
                 log_dbg!(
                     "Linked non-lazy host function {} at {:?}",
                     symbol,
@@ -1364,7 +1382,7 @@ impl Dyld {
                         .create_proc_address_no_inval(mem, sym)
                         .unwrap()
                         .to_ptr();
-                    mem.write(ptr_ptr, trampoline_ptr);
+                    write_ptr_slot(mem, ptr_ptr, trampoline_ptr);
                     log_dbg!(
                         "Linked non-lazy {} -> {} at {:?}",
                         symbol,
@@ -1384,7 +1402,7 @@ impl Dyld {
                     .create_proc_address_no_inval(mem, symbol)
                     .unwrap()
                     .to_ptr();
-                mem.write(ptr_ptr, trampoline_ptr);
+                write_ptr_slot(mem, ptr_ptr, trampoline_ptr);
                 log_dbg!(
                     "Linked non-lazy host function {} at {:?}",
                     symbol,
@@ -1407,7 +1425,7 @@ impl Dyld {
             // NULL-page read at 0x0.
             if symbol == "__NSConcreteStackBlock" || symbol == "__NSConcreteGlobalBlock" {
                 let dummy = mem.alloc(16);
-                mem.write(ptr_ptr, dummy.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, dummy.cast().cast_const());
                 log_dbg!(
                     "Patched non-lazy block class {} -> {:#x}",
                     symbol,
@@ -1431,7 +1449,7 @@ impl Dyld {
             // unwinder keeps moving instead of branching to 0x0.
             if symbol == "_OBJC_EHTYPE_id" || symbol == "_OBJC_EHTYPE_$_NSException" {
                 let dummy = mem.alloc(32);
-                mem.write(ptr_ptr, dummy.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, dummy.cast().cast_const());
                 log_dbg!(
                     "Patched ObjC EH type descriptor {} -> {:#x}",
                     symbol,
@@ -1447,7 +1465,7 @@ impl Dyld {
                 let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
                 mem.write(fn_ptr + 0, encode_a32_ret());
                 mem.write(fn_ptr + 1, encode_a32_trap());
-                mem.write(ptr_ptr, fn_ptr.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, fn_ptr.cast().cast_const());
                 log_dbg!("Stubbed ___objc_personality_v0 -> {:#x}", fn_ptr.to_bits());
                 continue;
             }
@@ -1457,7 +1475,7 @@ impl Dyld {
             if symbol == "___mb_cur_max" {
                 let val_ptr: MutPtr<u32> = mem.alloc(4).cast();
                 mem.write(val_ptr, 1u32);
-                mem.write(ptr_ptr, val_ptr.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, val_ptr.cast().cast_const());
                 log_dbg!("Stubbed ___mb_cur_max -> {:#x}", val_ptr.to_bits());
                 continue;
             }
@@ -1466,7 +1484,7 @@ impl Dyld {
                 let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
                 mem.write(fn_ptr + 0, encode_a32_ret());
                 mem.write(fn_ptr + 1, encode_a32_trap());
-                mem.write(ptr_ptr, fn_ptr.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, fn_ptr.cast().cast_const());
                 log_dbg!("Stubbed ___gxx_personality_sj0 -> {:#x}", fn_ptr.to_bits());
                 continue;
             }
@@ -1478,7 +1496,7 @@ impl Dyld {
                 // Default-NULL global handler pointer.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
                 mem.write(p, 0);
-                mem.write(ptr_ptr, p.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, p.cast().cast_const());
                 continue;
             }
 
@@ -1505,7 +1523,7 @@ impl Dyld {
                 // See the matching branch in the external-relocation loop.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
                 mem.write(p, 0);
-                mem.write(ptr_ptr, p.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, p.cast().cast_const());
                 log_dbg!(
                     "Stubbed libdispatch identity tag {} -> {:#x}",
                     symbol,
@@ -1522,7 +1540,7 @@ impl Dyld {
                 if symbol == "_in6addr_loopback" {
                     mem.write(p + 15, 1u8);
                 }
-                mem.write(ptr_ptr, p.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, p.cast().cast_const());
                 continue;
             }
 
@@ -1531,7 +1549,7 @@ impl Dyld {
                 for i in 0..12 {
                     mem.write(p + i, 0);
                 }
-                mem.write(ptr_ptr, p.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, p.cast().cast_const());
                 continue;
             }
 
@@ -1558,7 +1576,7 @@ impl Dyld {
                 );
                 // A non-lazy symbol pointer holds the plain address of the
                 // named symbol (no addend), so it resolves to the vtable base.
-                mem.write(ptr_ptr, target);
+                write_ptr_slot(mem, ptr_ptr, target);
                 log_dbg!("Stubbed C++ vtable {} -> {:#x}", symbol, target.to_bits());
                 continue;
             }
@@ -1577,7 +1595,7 @@ impl Dyld {
                         crate::mem::Ptr::from_bits(slot.to_bits())
                     }
                 };
-                mem.write(ptr_ptr, target.cast());
+                write_ptr_slot(mem, ptr_ptr, target.cast());
                 log_dbg!("Linked Swift runtime symbol {} at {:#x}", symbol, target.to_bits());
                 continue;
             }
@@ -1615,18 +1633,18 @@ impl Dyld {
                     &mut self.cxxabi_typeinfo_vtable_kinds,
                     mem,
                 );
-                mem.write(ptr_ptr, ti);
+                write_ptr_slot(mem, ptr_ptr, ti);
                 log_dbg!("Stubbed C++ typeinfo {} at {:#x}", symbol, ti.to_bits());
                 continue;
             }
 
             if let Some(stub) = self.cxxabi_intercept(mem, symbol) {
-                mem.write(ptr_ptr, stub.to_ptr());
+                write_ptr_slot(mem, ptr_ptr, stub.to_ptr());
                 continue;
             }
 
             if let Some(addr) = local_code_symbol(bin, symbol) {
-                mem.write(ptr_ptr, Ptr::from_bits(addr));
+                write_ptr_slot(mem, ptr_ptr, Ptr::from_bits(addr));
                 continue;
             }
 
@@ -1637,7 +1655,7 @@ impl Dyld {
                     &mut self.cxxabi_typeinfo_vtable_kinds,
                     mem,
                 );
-                mem.write(ptr_ptr, target);
+                write_ptr_slot(mem, ptr_ptr, target);
                 continue;
             }
 
@@ -1648,13 +1666,13 @@ impl Dyld {
                     &mut self.cxxabi_typeinfo_vtable_kinds,
                     mem,
                 );
-                mem.write(ptr_ptr, ti);
+                write_ptr_slot(mem, ptr_ptr, ti);
                 continue;
             }
 
             if symbol.starts_with("__ZTS") {
                 let cstr = mem.alloc_and_write_cstr(symbol.strip_prefix("__ZTS").unwrap_or(symbol).as_bytes());
-                mem.write(ptr_ptr, cstr.cast().cast_const());
+                write_ptr_slot(mem, ptr_ptr, cstr.cast().cast_const());
                 continue;
             }
 
@@ -1673,7 +1691,7 @@ impl Dyld {
                 self.non_lazy_host_functions.insert(leaked_symbol, created);
                 created
             };
-            mem.write(ptr_ptr, function_ptr.to_ptr());
+            write_ptr_slot(mem, ptr_ptr, function_ptr.to_ptr());
             }
         }
 
@@ -1684,22 +1702,29 @@ impl Dyld {
     /// Not to be confused with lazy linking.
     pub fn do_late_linking(env: &mut Environment) {
         // TODO: do symbols ever appear in __nl_symbol_ptr multiple times?
+        let is_arm64 = env.bins.first().is_some_and(|b| b.is_arm64);
         let to_link = std::mem::take(&mut env.dyld.constants_to_link_later);
         for (symbol_ptr_ptr, template) in to_link {
             let symbol_ptr: ConstVoidPtr = match template {
                 HostConstant::NSString(static_str) => {
                     let string_ptr = ns_string::get_static_str(env, static_str);
-                    let string_ptr_ptr = env.mem.alloc_and_write(string_ptr);
+                    let string_ptr_ptr = env.mem.alloc_and_write(string_ptr.to_bits() as u64);
                     string_ptr_ptr.cast().cast_const()
                 }
                 HostConstant::NullPtr => {
-                    let null_ptr: ConstVoidPtr = Ptr::null();
-                    let null_ptr_ptr = env.mem.alloc_and_write(null_ptr);
+                    let null_ptr_ptr = env.mem.alloc_and_write(0u64);
                     null_ptr_ptr.cast().cast_const()
                 }
                 HostConstant::Custom(f) => f(env),
             };
-            env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
+            if is_arm64 {
+                env.mem.write(
+                    Ptr::<u64, true>::from_bits(symbol_ptr_ptr.to_bits()),
+                    symbol_ptr.to_bits() as u64,
+                );
+            } else {
+                env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
+            }
         }
     }
 
@@ -2530,6 +2555,7 @@ mod lazy_link_recovery_tests {
             entry_point_is_lc_main: false,
             last_segment_end: 0x2000,
             text_base: 0x1000,
+            is_arm64: false,
         }
     }
 

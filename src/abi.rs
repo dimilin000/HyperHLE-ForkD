@@ -9,6 +9,7 @@
 //! Useful resources:
 //!
 //! * Apple's [Writing ARMv6 code for iOS](https://developer.apple.com/documentation/xcode/writing-armv6-code-for-ios), read together with Arm's [Procedure Call Standard for the Arm Architecture (AAPCS32)](https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst).
+//! * Apple's [Writing ARM64 code for Apple Platforms](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms).
 //!
 //! See also: [crate::mem::SafeRead] and [crate::mem::SafeWrite].
 
@@ -19,8 +20,35 @@ use crate::Environment;
 /// The register number of the frame pointer in Apple's ABI.
 pub const FRAME_POINTER: usize = 7;
 
-/// Address of an A32 or T32 instruction, with the mode encoded using the Thumb
-/// bit. This is also used as an (untyped) guest function pointer.
+/// Register class of an argument or return value when translating to/from
+/// 64-bit `AAPCS64` (Apple Darwin ARM64 PCS).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Arm64ArgClass {
+    /// Passed in general-purpose registers `X0..X7` (one `X` register per `u32` slot).
+    General,
+    /// 64-bit integer (`u64` / `i64`), passed in a single `X` register.
+    Int64,
+    /// Single-precision float (`f32`) or `CGFloat` (which is `f64` on 64-bit iOS),
+    /// passed in `V0..V7` (`S0..S7` or `D0..D7`).
+    Float32,
+    /// Double-precision float (`f64`), passed in `D0..D7`.
+    Float64,
+    /// Homogeneous floating-point aggregate (`CGPoint`, `CGSize`, `CGRect`,
+    /// `CGVector`, `UIEdgeInsets`), passed in consecutive `D` registers.
+    FloatAggregate,
+}
+
+#[inline]
+fn vreg_to_f32(raw: u64) -> f32 {
+    if (raw >> 32) == 0 {
+        f32::from_bits(raw as u32)
+    } else {
+        f64::from_bits(raw) as f32
+    }
+}
+
+/// Address of an A32, T32, or A64 instruction, with the Thumb mode encoded
+/// using the Thumb bit. This is also used as an (untyped) guest function pointer.
 ///
 /// It is wrapped in a struct to prevent mixing with other pointers.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -39,7 +67,7 @@ impl GuestFunction {
     }
 
     /// Returns `true` if the function uses regular Thumb (T32) instructions,
-    /// or `false` if it uses regular regular Arm (A32) instructions.
+    /// or `false` if it uses regular Arm (A32/A64) instructions.
     pub fn is_thumb(self) -> bool {
         self.0.to_bits() & Self::THUMB_BIT == Self::THUMB_BIT
     }
@@ -78,6 +106,9 @@ impl GuestFunction {
 
         env.cpu.branch(old_pc);
         env.cpu.regs_mut()[Cpu::LR] = old_lr.addr_with_thumb_bit();
+        if let Some(arm64) = env.cpu.arm64_mut() {
+            arm64.x[30] = old_lr.addr_without_thumb_bit() as u64;
+        }
 
         log_dbg!(
             "End call to guest function {:?} (no stack frame popped)",
@@ -93,28 +124,247 @@ impl GuestFunction {
 
 /// This trait represents a host function that can be called from guest code.
 ///
-/// For a guest-to-host call to work, several pieces need to work in concert:
-/// * The dynamic linker ([crate::dyld]) creates a stub guest function that the
-///   guest code can call.
-/// * When the guest code calls the stub function, the CPU emulation is paused,
-///   and the correct [CallFromGuest] implementation is looked up and called.
-/// * The [CallFromGuest] implementation
-///   * extracts the arguments, if any, from the guest CPU registers or guest
-///     stack, according to the calling convention;
-///   * executes the actual implementation of the function; and
-///   * writes the return value, if any, to the guest CPU registers or guest
-///     stack, according to the calling convention.
-/// * The CPU emulation is resumed.
-/// * The stub function returns to the caller (if appropriate).
-///
-/// This module should provide generic implementations of this trait for Rust
-/// [function pointers][fn] with compatible argument and return types. Only
-/// unusual cases should need to provide their own implementation.
-///
 /// See also [CallFromHost] and
 /// [GuestFunction::call_without_pushing_stack_frame].
 pub trait CallFromGuest {
     fn call_from_guest(&self, env: &mut Environment);
+}
+
+fn read_next_arg_arm64<T: GuestArg>(
+    gp_idx: &mut usize,
+    fp_idx: &mut usize,
+    stack_off: &mut u32,
+    env: &Environment,
+) -> T {
+    let mut fake_regs = [0u32; 16];
+    let sp = env.cpu.regs()[Cpu::SP];
+    let Some(arm64) = env.cpu.arm64() else {
+        return T::from_regs(&fake_regs[0..T::REG_COUNT]);
+    };
+
+    match T::ARM64_CLASS {
+        Arm64ArgClass::Float32 => {
+            let val = if *fp_idx < 8 {
+                let raw = arm64.v[*fp_idx][0];
+                *fp_idx += 1;
+                vreg_to_f32(raw)
+            } else {
+                let raw: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                *stack_off += 8;
+                vreg_to_f32(raw)
+            };
+            fake_regs[0] = val.to_bits();
+        }
+        Arm64ArgClass::Float64 => {
+            let raw = if *fp_idx < 8 {
+                let r = arm64.v[*fp_idx][0];
+                *fp_idx += 1;
+                r
+            } else {
+                let r: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                *stack_off += 8;
+                r
+            };
+            let bits = if (raw >> 32) == 0 && raw != 0 {
+                (f32::from_bits(raw as u32) as f64).to_bits()
+            } else {
+                raw
+            };
+            fake_regs[0] = bits as u32;
+            fake_regs[1] = (bits >> 32) as u32;
+        }
+        Arm64ArgClass::FloatAggregate => {
+            for i in 0..T::REG_COUNT {
+                let val = if *fp_idx < 8 {
+                    let raw = arm64.v[*fp_idx][0];
+                    *fp_idx += 1;
+                    vreg_to_f32(raw)
+                } else {
+                    let raw: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                    *stack_off += 8;
+                    vreg_to_f32(raw)
+                };
+                fake_regs[i] = val.to_bits();
+            }
+        }
+        Arm64ArgClass::Int64 => {
+            let val = if *gp_idx < 8 {
+                let r = arm64.x[*gp_idx];
+                *gp_idx += 1;
+                r
+            } else {
+                let r: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                *stack_off += 8;
+                r
+            };
+            fake_regs[0] = val as u32;
+            fake_regs[1] = (val >> 32) as u32;
+        }
+        Arm64ArgClass::General => {
+            for i in 0..T::REG_COUNT {
+                let val = if *gp_idx < 8 {
+                    let r = arm64.x[*gp_idx] as u32;
+                    *gp_idx += 1;
+                    r
+                } else {
+                    let r: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                    *stack_off += 8;
+                    r as u32
+                };
+                fake_regs[i] = val;
+            }
+        }
+    }
+
+    T::from_regs(&fake_regs[0..T::REG_COUNT])
+}
+
+fn write_next_arg_arm64<T: GuestArg>(
+    gp_idx: &mut usize,
+    fp_idx: &mut usize,
+    arg: T,
+    env: &mut Environment,
+) {
+    let mut fake_regs = [0u32; 16];
+    let slice = &mut fake_regs[0..T::REG_COUNT];
+    arg.to_regs(slice);
+
+    let Some(arm64) = env.cpu.arm64_mut() else {
+        return;
+    };
+
+    match T::ARM64_CLASS {
+        Arm64ArgClass::Float32 => {
+            if *fp_idx < 8 {
+                let f = f32::from_bits(slice[0]);
+                // Store as f64 (`CGFloat`) if non-zero, wait: most ObjC callbacks
+                // on 64-bit iOS take `CGFloat` (`double`).
+                arm64.v[*fp_idx][0] = (f as f64).to_bits();
+                arm64.v[*fp_idx][1] = 0;
+                *fp_idx += 1;
+            }
+        }
+        Arm64ArgClass::Float64 => {
+            if *fp_idx < 8 {
+                let bits = (slice[0] as u64) | ((slice[1] as u64) << 32);
+                arm64.v[*fp_idx][0] = bits;
+                arm64.v[*fp_idx][1] = 0;
+                *fp_idx += 1;
+            }
+        }
+        Arm64ArgClass::FloatAggregate => {
+            for &word in slice.iter() {
+                if *fp_idx < 8 {
+                    let f = f32::from_bits(word);
+                    arm64.v[*fp_idx][0] = (f as f64).to_bits();
+                    arm64.v[*fp_idx][1] = 0;
+                    *fp_idx += 1;
+                }
+            }
+        }
+        Arm64ArgClass::Int64 => {
+            if *gp_idx < 8 {
+                let bits = (slice[0] as u64) | ((slice[1] as u64) << 32);
+                arm64.x[*gp_idx] = bits;
+                *gp_idx += 1;
+            }
+        }
+        Arm64ArgClass::General => {
+            for &word in slice.iter() {
+                if *gp_idx < 8 {
+                    arm64.x[*gp_idx] = word as u64;
+                    *gp_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+fn write_retval_arm64<R: GuestRet>(retval: R, env: &mut Environment) {
+    if let Some(size) = R::SIZE_IN_MEM {
+        let scratch_addr = {
+            let arm64 = env.cpu.arm64().unwrap();
+            arm64.stret_scratch_addr
+        };
+        let scratch_addr = if scratch_addr == 0 {
+            let ptr = env.mem.alloc(128);
+            env.cpu.arm64_mut().unwrap().stret_scratch_addr = ptr.to_bits();
+            ptr.to_bits()
+        } else {
+            scratch_addr
+        };
+        let scratch_ptr: MutVoidPtr = Ptr::from_bits(scratch_addr);
+        retval.to_mem(scratch_ptr, &mut env.mem);
+
+        let word0: u32 = env.mem.read(Ptr::from_bits(scratch_addr));
+        let word1: u32 = if size >= 8 {
+            env.mem.read(Ptr::from_bits(scratch_addr + 4))
+        } else {
+            0
+        };
+        env.cpu.regs_mut()[0] = word0;
+        env.cpu.regs_mut()[1] = word1;
+
+        let float_count = ((size / 4) as usize).min(4);
+        let mut floats = [0.0f64; 4];
+        for (i, slot) in floats.iter_mut().enumerate().take(float_count) {
+            let w: u32 = env.mem.read(Ptr::from_bits(scratch_addr + (i as u32) * 4));
+            *slot = f32::from_bits(w) as f64;
+        }
+
+        let x8_addr = env.cpu.arm64().map_or(0, |a| a.x[8] as u32);
+        if size > 16
+            && x8_addr >= env.mem.null_segment_size()
+            && env
+                .mem
+                .get_bytes_fallible(Ptr::from_bits(x8_addr), size * 2)
+                .is_some()
+        {
+            let count = (size / 4) as usize;
+            for i in 0..count {
+                let w: u32 = env.mem.read(Ptr::from_bits(scratch_addr + (i as u32) * 4));
+                let d = f32::from_bits(w) as f64;
+                env.mem
+                    .write(Ptr::<u64, true>::from_bits(x8_addr + (i as u32) * 8), d.to_bits());
+            }
+        }
+
+        if let Some(arm64) = env.cpu.arm64_mut() {
+            arm64.x[0] = word0 as u64;
+            arm64.x[1] = word1 as u64;
+            for (i, &d) in floats.iter().enumerate().take(float_count) {
+                arm64.v[i][0] = d.to_bits();
+                arm64.v[i][1] = 0;
+            }
+        }
+    } else {
+        retval.to_regs(env.cpu.regs_mut());
+        let r0 = env.cpu.regs()[0];
+        let r1 = env.cpu.regs()[1];
+        if let Some(arm64) = env.cpu.arm64_mut() {
+            match R::ARM64_CLASS {
+                Arm64ArgClass::Float32 => {
+                    let f = f32::from_bits(r0);
+                    arm64.v[0][0] = (f as f64).to_bits();
+                    arm64.v[0][1] = 0;
+                    arm64.x[0] = r0 as u64;
+                }
+                Arm64ArgClass::Float64 => {
+                    let bits = (r0 as u64) | ((r1 as u64) << 32);
+                    arm64.v[0][0] = bits;
+                    arm64.v[0][1] = 0;
+                    arm64.x[0] = bits;
+                }
+                Arm64ArgClass::Int64 => {
+                    let bits = (r0 as u64) | ((r1 as u64) << 32);
+                    arm64.x[0] = bits;
+                }
+                _ => {
+                    arm64.x[0] = r0 as u64;
+                }
+            }
+        }
+    }
 }
 
 macro_rules! impl_CallFromGuest {
@@ -124,6 +374,18 @@ macro_rules! impl_CallFromGuest {
             // ignore warnings for the zero-argument case
             #[allow(unused_variables, unused_mut, clippy::unused_unit)]
             fn call_from_guest(&self, env: &mut Environment) {
+                if env.cpu.is_arm64() {
+                    let mut gp_idx = 0;
+                    let mut fp_idx = 0;
+                    let mut stack_off = 0;
+                    let args: ($($P,)*) = {
+                        ($(read_next_arg_arm64::<$P>(&mut gp_idx, &mut fp_idx, &mut stack_off, env),)*)
+                    };
+                    let retval = self(env, $(args.$p),*);
+                    write_retval_arm64(retval, env);
+                    return;
+                }
+
                 let mut reg_offset = 0;
                 let regs = env.cpu.regs();
                 let retval_ptr = R::SIZE_IN_MEM.map(|_| {
@@ -133,7 +395,7 @@ macro_rules! impl_CallFromGuest {
                     ($(read_next_arg::<$P>(&mut reg_offset, regs, Ptr::from_bits(regs[Cpu::SP]), &env.mem),)*)
                 };
 
-                log_dbg!("CallFromGuest"); // Убрали попытку вывести args из-за ограничений трейта Debug
+                log_dbg!("CallFromGuest");
 
                 let retval = self(env, $(args.$p),*);
                 log_dbg!("CallFromGuest => {:?}", retval);
@@ -149,6 +411,25 @@ macro_rules! impl_CallFromGuest {
             // ignore warnings for the zero-argument case
             #[allow(unused_variables, unused_mut, clippy::unused_unit)]
             fn call_from_guest(&self, env: &mut Environment) {
+                if env.cpu.is_arm64() {
+                    let mut gp_idx = 0;
+                    let mut fp_idx = 0;
+                    let mut stack_off = 0;
+                    let args: ($($P,)*) = {
+                        ($(read_next_arg_arm64::<$P>(&mut gp_idx, &mut fp_idx, &mut stack_off, env),)*)
+                    };
+                    // On Apple Darwin ARM64 PCS, variadic arguments (`...`) are
+                    // always placed on the stack starting at `[SP + stack_off]`.
+                    let sp = env.cpu.regs()[Cpu::SP] + stack_off;
+                    let va_list = DotDotDot(VaList {
+                        reg_offset: 4,
+                        stack_pointer: Ptr::from_bits(sp),
+                    });
+                    let retval = self(env, $(args.$p,)* va_list);
+                    write_retval_arm64(retval, env);
+                    return;
+                }
+
                 let mut reg_offset = 0;
                 let regs = env.cpu.regs();
                 let retval_ptr = R::SIZE_IN_MEM.map(|_| {
@@ -162,7 +443,7 @@ macro_rules! impl_CallFromGuest {
                     stack_pointer: Ptr::from_bits(regs[Cpu::SP])
                 });
 
-                log_dbg!("CallFromGuest with va_list: {:?}", va_list); // Аналогично убрали args
+                log_dbg!("CallFromGuest with va_list: {:?}", va_list);
 
                 let retval = self(env, $(args.$p,)* va_list);
                 log_dbg!("CallFromGuest => {:?}", retval);
@@ -198,35 +479,6 @@ impl_CallFromGuest!(0 => P0, 1 => P1, 2 => P2, 3 => P3, 4 => P4, 5 => P5, 6 => P
 /// code, but using the guest ABI. See [CallFromGuest], which this is the
 /// inverse of.
 pub trait CallFromHost<R, P> {
-    /// Execute the "guest" function and return to the host when it is done.
-    /// Note that this does not mean that the function is actually a guest
-    /// function, just that it acts as one for this trait.
-    ///
-    /// For calls to actual guest functions, a new stack frame will be
-    /// created for the duration of the call.
-    ///
-    /// For a host-to-guest call to work, several pieces need to work in
-    /// concert:
-    /// * A new stack frame is pushed (this is optional, but makes stack
-    ///   traces clearer)
-    /// * The arguments to the function are placed in registers or the
-    ///   stack according to the calling convention. This is handled by
-    ///   this trait; functions that pass through arguments to another
-    ///   function (such as `objc_msgsend`) should call
-    ///   [GuestFunction::call_without_pushing_stack_frame] instead.
-    /// * The program counter (PC) and Thumb flag have to be set to match
-    ///   the function being called;
-    /// * The link register (LR) to point to a special routine for
-    ///   returning to the host;
-    /// * The emulated function eventually returns to the caller by jumping to
-    ///   the address in the link register, which should be the special
-    ///   routine.
-    /// * The CPU emulation recognises the special routine and returns back to
-    ///   this method.
-    /// * This method restores the original PC, Thumb flag and LR, and pops any
-    ///   stack arguments and the stack frame.
-    /// * The return values are extracted from registers or the stack, if
-    ///   appropriate.
     fn call_from_host(&self, env: &mut Environment, args: P) -> R;
 }
 
@@ -241,14 +493,21 @@ macro_rules! impl_CallFromHost {
                 env: &mut Environment,
                 args: ($($P,)*),
             ) -> R {
+                if env.cpu.is_arm64() {
+                    let mut gp_idx = 0;
+                    let mut fp_idx = 0;
+                    $(write_next_arg_arm64::<$P>(&mut gp_idx, &mut fp_idx, args.$p, env);)*
+                }
+
                 let mut reg_offset = 0;
                 let regs = env.cpu.regs_mut();
                 let retval_ptr = R::SIZE_IN_MEM.map(|size| {
-                    regs[Cpu::SP] -= size;
+                    let aligned_size = (size + 15) & !15;
+                    regs[Cpu::SP] -= aligned_size;
                     let sp_bits = regs[Cpu::SP];
                     let ptr: ConstVoidPtr = Ptr::from_bits(sp_bits);
                     env.mem
-                        .bytes_at_mut(Ptr::from_bits(sp_bits), size)
+                        .bytes_at_mut(Ptr::from_bits(sp_bits), aligned_size)
                         .fill(0);
                     write_next_arg(&mut reg_offset, regs, &mut env.mem, ptr);
                     ptr
@@ -266,10 +525,24 @@ macro_rules! impl_CallFromHost {
                 regs[Cpu::SP] = old_sp;
 
                 if let Some(retval_ptr) = retval_ptr {
-                    regs[Cpu::SP] += R::SIZE_IN_MEM.unwrap();
+                    let aligned_size = (R::SIZE_IN_MEM.unwrap() + 15) & !15;
+                    regs[Cpu::SP] += aligned_size;
+                    if env.cpu.is_arm64() {
+                        if let Some(arm64) = env.cpu.arm64() {
+                            if arm64.stret_scratch_addr != 0 {
+                                let src = env
+                                    .mem
+                                    .bytes_at(Ptr::from_bits(arm64.stret_scratch_addr), R::SIZE_IN_MEM.unwrap())
+                                    .to_vec();
+                                env.mem
+                                    .bytes_at_mut(Ptr::from_bits(retval_ptr.to_bits()), R::SIZE_IN_MEM.unwrap())
+                                    .copy_from_slice(&src);
+                            }
+                        }
+                    }
                     <R as GuestRet>::from_mem(retval_ptr, &env.mem)
                 } else {
-                    <R as GuestRet>::from_regs(regs)
+                    <R as GuestRet>::from_regs(env.cpu.regs())
                 }
             }
         }
@@ -289,14 +562,13 @@ macro_rules! impl_CallFromHost {
                     .cpu
                     .branch_with_link(*self, env.dyld.return_to_host_routine());
 
-                // Create a new guest stack frame. This is redundant considering
-                // we are storing this data on the host stack, but this makes
-                // stack traces work nicely. :)
+                // Create a new guest stack frame (16-byte aligned so both AAPCS32
+                // and AAPCS64 stack alignment invariants hold).
                 let (old_sp, old_fp, host_to_guest_frame_pointer) = {
                     let regs = env.cpu.regs_mut();
                     let old_sp = regs[Cpu::SP];
                     let old_fp = regs[FRAME_POINTER];
-                    regs[Cpu::SP] -= 8;
+                    regs[Cpu::SP] = (regs[Cpu::SP] - 16) & !15;
                     regs[FRAME_POINTER] = regs[Cpu::SP];
 
                     env.mem
@@ -306,6 +578,17 @@ macro_rules! impl_CallFromHost {
                 };
 
                 assert!(R::SIZE_IN_MEM.is_none()); // pointer return TODO
+
+                if env.cpu.is_arm64() {
+                    let sp_now = env.cpu.regs()[Cpu::SP];
+                    if let Some(arm64) = env.cpu.arm64_mut() {
+                        arm64.sp = sp_now as u64;
+                    }
+                    let mut gp_idx = 0;
+                    let mut fp_idx = 0;
+                    $(write_next_arg_arm64::<$P>(&mut gp_idx, &mut fp_idx, args.$p, env);)*
+                }
+
                 let regs = env.cpu.regs_mut();
 
                 let _ = extend_stack_for_args(
@@ -316,10 +599,6 @@ macro_rules! impl_CallFromHost {
                 let mut reg_offset = 0;
                 $(write_next_arg::<$P>(&mut reg_offset, regs, &mut env.mem, args.$p);)*
 
-                // It would actually be possible to use
-                // [GuestFunction::call_without_pushing_stack_frame] here, but
-                // it would mess up debug logging, so duplicating the code
-                // is easier.
                 let host_to_guest_stack_frame =
                     env.push_host_to_guest_stack_frame(host_to_guest_frame_pointer);
                 let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -338,6 +617,10 @@ macro_rules! impl_CallFromHost {
                 regs[Cpu::LR] = old_lr.addr_with_thumb_bit();
                 regs[Cpu::SP] = old_sp;
                 regs[FRAME_POINTER] = old_fp;
+                if let Some(arm64) = env.cpu.arm64_mut() {
+                    arm64.x[30] = old_lr.addr_without_thumb_bit() as u64;
+                    arm64.sp = old_sp as u64;
+                }
                 <R as GuestRet>::from_regs(env.cpu.regs())
             }
         }
@@ -368,11 +651,14 @@ pub trait GuestArg: std::fmt::Debug + Sized {
     /// How many registers does this argument type consume?
     const REG_COUNT: usize;
 
+    /// Register class on 64-bit `AAPCS64`.
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::General;
+
     /// Read the argument from registers. Only `&regs[0..Self::REG_COUNT]` may
     /// be accessed.
     fn from_regs(regs: &[u32]) -> Self;
 
-    /// Write the argument to registers. Only '&mut regs[0..Self::REG_COUNT]`
+    /// Write the argument to registers. Only `&mut regs[0..Self::REG_COUNT]`
     /// may be accessed.
     fn to_regs(self, regs: &mut [u32]);
 }
@@ -385,11 +671,6 @@ fn read_next_arg<T: GuestArg>(
     stack_ptr: ConstPtr<u32>,
     mem: &Mem,
 ) -> T {
-    // After the fourth register is used, the arguments go on the stack.
-    // In some cases the argument is split over both registers and the stack.
-
-    // Rust doesn't allow [0u32; Trait::T] alas, so we need to set some
-    // arbitrary limit. 16 is high enough for everything right now.
     let mut fake_regs = [0u32; 16];
     let fake_regs = &mut fake_regs[0..T::REG_COUNT];
     for fake_reg in fake_regs.iter_mut() {
@@ -404,14 +685,8 @@ fn read_next_arg<T: GuestArg>(
     T::from_regs(fake_regs)
 }
 
-/// Decrements the stack pointer to prepare for calling [write_next_arg]. Pass
-/// the sum of the [GuestArg::REG_COUNT]s for all the arguments to be written,
-/// and this will update the stack pointer if necessary, as well as returning
-/// a copy of the original stack pointer so it can be restored later.
+/// Decrements the stack pointer to prepare for calling [write_next_arg].
 pub fn extend_stack_for_args(reg_count_sum: usize, regs: &mut [u32]) -> u32 {
-    // After the fourth register is used, the arguments go on the stack.
-    // In some cases the argument is split over both registers and the stack.
-
     let old = regs[Cpu::SP];
     if reg_count_sum > 4 {
         let old: ConstPtr<u32> = Ptr::from_bits(old);
@@ -420,22 +695,13 @@ pub fn extend_stack_for_args(reg_count_sum: usize, regs: &mut [u32]) -> u32 {
     old
 }
 
-/// Write a single argument to registers or the stack. Call this for each
-/// argument in order.
-///
-/// If `reg_offset` is or will be >= 4, the stack pointer **must** be
-/// appropriately decremented in advance! See [extend_stack_for_args].
+/// Write a single argument to registers or the stack.
 pub fn write_next_arg<T: GuestArg>(
     reg_offset: &mut usize,
     regs: &mut [u32],
     mem: &mut Mem,
     arg: T,
 ) {
-    // After the fourth register is used, the arguments go on the stack.
-    // In some cases the argument is split over both registers and the stack.
-
-    // Rust doesn't allow [0u32; Trait::T] alas.
-    // 16 is high enough for everything right now.
     let mut fake_regs = [0u32; 16];
     let fake_regs = &mut fake_regs[0..T::REG_COUNT];
     arg.to_regs(fake_regs);
@@ -462,18 +728,29 @@ impl DotDotDot {
 }
 
 /// Calling convention translation for a variable arguments list (like C
-/// `va_list`). When used as a function argument, this is equivalent to
-/// passing a `va_list` struct as an argument, e.g. `vprintf()`.
-/// See also [DotDotDot].
+/// `va_list`).
 #[derive(Copy, Clone, Debug)]
 pub struct VaList {
     reg_offset: usize,
     stack_pointer: ConstVoidPtr,
 }
 impl VaList {
-    /// Get the next argument, like C's `va_arg()`. Be careful as the type may
-    /// be inferred from the call-site if you don't specify it explicitly.
+    /// Get the next argument, like C's `va_arg()`.
     pub fn next<T: GuestArg>(&mut self, env: &mut Environment) -> T {
+        if env.cpu.is_arm64() {
+            let slot_idx = self.reg_offset.saturating_sub(4) as u32;
+            let addr = self.stack_pointer.to_bits() + slot_idx * 8;
+            let raw: u64 = env.mem.read(Ptr::from_bits(addr));
+            self.reg_offset += 1;
+            let mut fake_regs = [0u32; 16];
+            if T::REG_COUNT >= 2 {
+                fake_regs[0] = raw as u32;
+                fake_regs[1] = (raw >> 32) as u32;
+            } else if T::REG_COUNT == 1 {
+                fake_regs[0] = raw as u32;
+            }
+            return T::from_regs(&fake_regs[0..T::REG_COUNT]);
+        }
         let sp_reg = self.stack_pointer.cast();
         read_next_arg(&mut self.reg_offset, env.cpu.regs_mut(), sp_reg, &env.mem)
     }
@@ -483,6 +760,7 @@ macro_rules! impl_GuestArg_with {
     ($for:ty, $with:ty) => {
         impl GuestArg for $for {
             const REG_COUNT: usize = <$with as GuestArg>::REG_COUNT;
+            const ARM64_CLASS: Arm64ArgClass = <$with as GuestArg>::ARM64_CLASS;
             fn from_regs(regs: &[u32]) -> Self {
                 <$with as GuestArg>::from_regs(regs) as $for
             }
@@ -524,6 +802,7 @@ impl GuestArg for bool {
 
 impl GuestArg for f32 {
     const REG_COUNT: usize = <u32 as GuestArg>::REG_COUNT;
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::Float32;
     fn from_regs(regs: &[u32]) -> Self {
         Self::from_bits(<u32 as GuestArg>::from_regs(regs))
     }
@@ -555,17 +834,12 @@ impl GuestArg for GuestFunction {
 impl GuestArg for VaList {
     const REG_COUNT: usize = <ConstVoidPtr as GuestArg>::REG_COUNT;
     fn from_regs(regs: &[u32]) -> Self {
-        // `reg_offset` initialized to 4 as we want to use `stack_pointer` when
-        // calling [read_next_arg]
         VaList {
             reg_offset: 4,
             stack_pointer: <ConstVoidPtr as GuestArg>::from_regs(regs),
         }
     }
     fn to_regs(self, _regs: &mut [u32]) {
-        // Returning a VaList by value is not part of the AAPCS for guest
-        // code, and we never need to write one back to register state.
-        // Log it instead of panicking if someone happens to invoke it.
         log!(
             "Warning: VaList::to_regs called; var-args are read from the stack, never written back. Ignoring."
         );
@@ -576,6 +850,7 @@ impl GuestArg for VaList {
 
 impl GuestArg for u64 {
     const REG_COUNT: usize = 2;
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::Int64;
     fn from_regs(regs: &[u32]) -> Self {
         let mut bytes = [0u8; 8];
         bytes[0..4].copy_from_slice(&regs[0].to_le_bytes());
@@ -593,6 +868,7 @@ impl_GuestArg_with!(i64, u64);
 
 impl GuestArg for f64 {
     const REG_COUNT: usize = <u64 as GuestArg>::REG_COUNT;
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::Float64;
     fn from_regs(regs: &[u32]) -> Self {
         Self::from_bits(<u64 as GuestArg>::from_regs(regs))
     }
@@ -601,17 +877,10 @@ impl GuestArg for f64 {
     }
 }
 
-// TODO: Do we need to distinguish arguments from return types, don't they
-// usually behave the same? Are there exceptions? Do we merge the types?
-
 /// Calling convention translation for a function return type.
 pub trait GuestRet: std::fmt::Debug + Sized {
-    /// If this is `None`, then the return value is passed directly in
-    /// registers and the `to_regs` and `from_regs` methods should be used.
-    /// If this is `Some(size)`, then the return value is of `size` bytes and is
-    /// stored in memory at the location specified by an implicit pointer
-    /// argument in r0, and the `to_mem` and `from_mem` methods should be used.
     const SIZE_IN_MEM: Option<GuestUSize> = None;
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::General;
 
     /// Read the return value from registers.
     fn from_regs(regs: &[u32]) -> Self {
@@ -649,6 +918,7 @@ pub trait GuestRet: std::fmt::Debug + Sized {
 macro_rules! impl_GuestRet_with {
     ($for:ty, $with:ty) => {
         impl GuestRet for $for {
+            const ARM64_CLASS: Arm64ArgClass = <$with as GuestRet>::ARM64_CLASS;
             fn from_regs(regs: &[u32]) -> Self {
                 <$with as GuestRet>::from_regs(regs) as $for
             }
@@ -660,9 +930,7 @@ macro_rules! impl_GuestRet_with {
 }
 
 /// Generates a trait implementation of [GuestRet] for a struct type that is
-/// larger than 4 bytes (and thus returned via an implicit pointer parameter
-/// rather than via registers). The type must have implementations of
-/// [crate::mem::SafeRead] and [crate::mem::SafeWrite].
+/// larger than 4 bytes.
 #[macro_export]
 macro_rules! impl_GuestRet_for_large_struct {
     ($for:ty) => {
@@ -680,14 +948,10 @@ macro_rules! impl_GuestRet_for_large_struct {
         }
     };
 }
-pub use crate::impl_GuestRet_for_large_struct; // #[macro_export] is weird...
+pub use crate::impl_GuestRet_for_large_struct;
 
 impl GuestRet for () {
-    fn to_regs(self, _regs: &mut [u32]) {
-        // objc_msgSend (see src/objc/messages.rs) relies on this not touching
-        // the registers, because () will be "returned" after the function it's
-        // meant to be tail-calling.
-    }
+    fn to_regs(self, _regs: &mut [u32]) {}
     fn from_regs(_regs: &[u32]) -> Self {}
 }
 
@@ -719,6 +983,7 @@ impl GuestRet for bool {
 }
 
 impl GuestRet for f32 {
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::Float32;
     fn from_regs(regs: &[u32]) -> Self {
         Self::from_bits(<u32 as GuestRet>::from_regs(regs))
     }
@@ -739,6 +1004,7 @@ impl<T, const MUT: bool> GuestRet for Ptr<T, MUT> {
 // GuestRet implementations for u64-like types
 
 impl GuestRet for u64 {
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::Int64;
     fn from_regs(regs: &[u32]) -> Self {
         let mut bytes = [0u8; 8];
         bytes[0..4].copy_from_slice(&regs[0].to_le_bytes());
@@ -755,6 +1021,7 @@ impl GuestRet for u64 {
 impl_GuestRet_with!(i64, u64);
 
 impl GuestRet for f64 {
+    const ARM64_CLASS: Arm64ArgClass = Arm64ArgClass::Float64;
     fn from_regs(regs: &[u32]) -> Self {
         Self::from_bits(<u64 as GuestRet>::from_regs(regs))
     }

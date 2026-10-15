@@ -95,15 +95,33 @@ impl ClassHostObject {
         let ivars_base_ptr: ConstPtr<ivar_t> = (ivar_list_ptr + 1).cast();
 
         for i in 0..count {
-            let ivar_ptr: ConstPtr<ivar_t> = Ptr::from_bits(ivars_base_ptr.to_bits() + i * entsize);
+            let entry_addr = ivars_base_ptr.to_bits() + i * entsize;
+            let ivar_ptr: ConstPtr<ivar_t> = Ptr::from_bits(entry_addr);
 
-            let ivar_t {
-                offset,
-                name,
-                alignment,
-                type_,
-                size,
-            } = mem.read(ivar_ptr);
+            let (offset, name, type_, alignment, size) = if entsize == 32 {
+                let offset_u64: u64 = mem.read(Ptr::from_bits(entry_addr));
+                let name_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 8));
+                let type_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 16));
+                let align_raw: u32 = mem.read(Ptr::from_bits(entry_addr + 24));
+                let size_raw: u32 = mem.read(Ptr::from_bits(entry_addr + 28));
+                let alignment = 1u32 << align_raw.min(6);
+                (
+                    Ptr::from_bits(offset_u64 as u32),
+                    Ptr::from_bits(name_u64 as u32),
+                    Ptr::from_bits(type_u64 as u32),
+                    alignment,
+                    size_raw,
+                )
+            } else {
+                let ivar_t {
+                    offset,
+                    name,
+                    alignment,
+                    type_,
+                    size,
+                } = mem.read(ivar_ptr);
+                (offset, name, type_, alignment, size)
+            };
 
             let Ok(name_string) = mem.cstr_at_utf8(name) else {
                 log!(
@@ -166,10 +184,16 @@ impl ClassHostObject {
         let props_base_ptr: ConstPtr<property_t> = (prop_list_ptr + 1).cast();
 
         for i in 0..count {
-            let prop_ptr: ConstPtr<property_t> =
-                Ptr::from_bits(props_base_ptr.to_bits() + i * entsize);
+            let entry_addr = props_base_ptr.to_bits() + i * entsize;
+            let prop_ptr: ConstPtr<property_t> = Ptr::from_bits(entry_addr);
 
-            let property_t { name, .. } = mem.read(prop_ptr);
+            let name: ConstPtr<u8> = if entsize == 16 {
+                let name_u64: u64 = mem.read(Ptr::from_bits(entry_addr));
+                Ptr::from_bits(name_u64 as u32)
+            } else {
+                let property_t { name, .. } = mem.read(prop_ptr);
+                name
+            };
 
             if name.is_null() {
                 continue;

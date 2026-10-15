@@ -731,7 +731,8 @@ impl ObjC {
         // (FIXME: this actually should apply to any class hiearchy root.)
         // This creates a chicken-and-egg problem so it has a special path.
         let metaclass = if name == "NSObject" {
-            let metaclass = mem.alloc_and_write(objc_object { isa: nil });
+            let metaclass: id = mem.alloc(8).cast();
+            mem.bytes_at_mut(metaclass.cast(), 8).fill(0);
             mem.write(metaclass, objc_object { isa: metaclass });
             self.register_static_object(metaclass, metaclass_host_object);
             metaclass
@@ -756,17 +757,87 @@ impl ObjC {
 
     /// For use by [crate::dyld]: register all the classes from the application
     /// binary.
+    fn convert_arm64_class_in_place(
+        class: Class,
+        mem: &mut Mem,
+        converted: &mut std::collections::HashSet<u32>,
+    ) {
+        let c_addr = class.to_bits();
+        if c_addr == 0 || !converted.insert(c_addr) {
+            return;
+        }
+        let isa_u64: u64 = mem.read(Ptr::from_bits(c_addr));
+        let super_u64: u64 = mem.read(Ptr::from_bits(c_addr + 8));
+        let data_u64: u64 = mem.read(Ptr::from_bits(c_addr + 32));
+        let isa: Class = Ptr::from_bits(isa_u64 as u32);
+        let superclass: Class = Ptr::from_bits(super_u64 as u32);
+        let data_addr: u32 = (data_u64 as u32) & !7;
+
+        if data_addr != 0 && converted.insert(data_addr) {
+            let flags: u32 = mem.read(Ptr::from_bits(data_addr));
+            let instance_start: u32 = mem.read(Ptr::from_bits(data_addr + 4));
+            let instance_size: u32 = mem.read(Ptr::from_bits(data_addr + 8));
+            let reserved: u32 = mem.read(Ptr::from_bits(data_addr + 12));
+            let name_u64: u64 = mem.read(Ptr::from_bits(data_addr + 24));
+            let base_methods_u64: u64 = mem.read(Ptr::from_bits(data_addr + 32));
+            let base_protocols_u64: u64 = mem.read(Ptr::from_bits(data_addr + 40));
+            let ivars_u64: u64 = mem.read(Ptr::from_bits(data_addr + 48));
+            let weak_ivar_u64: u64 = mem.read(Ptr::from_bits(data_addr + 56));
+            let base_props_u64: u64 = mem.read(Ptr::from_bits(data_addr + 64));
+
+            let rw32 = class_rw_t {
+                _flags: flags,
+                instance_start,
+                instance_size,
+                _reserved: reserved,
+                name: Ptr::from_bits(name_u64 as u32),
+                base_methods: Ptr::from_bits(base_methods_u64 as u32),
+                _base_protocols: Ptr::from_bits(base_protocols_u64 as u32),
+                ivars: Ptr::from_bits(ivars_u64 as u32),
+                _weak_ivar_layout: weak_ivar_u64 as u32,
+                _base_properties: Ptr::from_bits(base_props_u64 as u32),
+            };
+            let rw_bytes: [u8; 40] = unsafe { std::mem::transmute(rw32) };
+            mem.bytes_at_mut(Ptr::from_bits(data_addr), 40)
+                .copy_from_slice(&rw_bytes);
+        }
+
+        let cls32 = class_t {
+            isa,
+            superclass,
+            _cache: Ptr::null(),
+            _vtable: Ptr::null(),
+            data: Ptr::from_bits(data_addr),
+        };
+        let cls_bytes: [u8; 20] = unsafe { std::mem::transmute(cls32) };
+        mem.bytes_at_mut(Ptr::from_bits(c_addr), 20)
+            .copy_from_slice(&cls_bytes);
+
+        if isa != nil {
+            Self::convert_arm64_class_in_place(isa, mem, converted);
+        }
+    }
+
     pub fn register_bin_classes(&mut self, bundle: &bundle::Bundle, bin: &MachO, mem: &mut Mem) {
         let Some(list) = bin.get_section("__objc_classlist") else {
             return;
         };
 
-        assert!(list.size % 4 == 0);
-        let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
-        let total_entries = list.size / 4;
+        let ptr_stride = if bin.is_arm64 { 8 } else { 4 };
+        assert!(list.size % ptr_stride == 0);
+        let total_entries = list.size / ptr_stride;
         let mut garbage_entries: u32 = 0;
+        let mut converted_arm64 = std::collections::HashSet::new();
         for i in 0..total_entries {
-            let class = mem.read(base + i);
+            let class: Class = if bin.is_arm64 {
+                let raw: u64 = mem.read(Ptr::from_bits(list.addr + i * 8));
+                let cls: Class = Ptr::from_bits(raw as u32);
+                Self::convert_arm64_class_in_place(cls, mem, &mut converted_arm64);
+                cls
+            } else {
+                let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
+                mem.read(base + i)
+            };
             let metaclass = Self::read_isa(class, mem);
 
             // A truncated Mach-O (e.g. Bug Heroes Quest's trimmed armv6 slice,
@@ -1107,10 +1178,40 @@ impl ObjC {
             return;
         };
 
-        assert!(list.size % 4 == 0);
-        let base: ConstPtr<ConstPtr<category_t>> = Ptr::from_bits(list.addr);
-        for i in 0..(list.size / 4) {
-            let cat_ptr = mem.read(base + i);
+        let ptr_stride = if bin.is_arm64 { 8 } else { 4 };
+        assert!(list.size % ptr_stride == 0);
+        for i in 0..(list.size / ptr_stride) {
+            let cat_ptr: ConstPtr<category_t> = if bin.is_arm64 {
+                let raw: u64 = mem.read(Ptr::from_bits(list.addr + i * 8));
+                let c_addr = raw as u32;
+                if c_addr == 0 {
+                    continue;
+                }
+                let name_u64: u64 = mem.read(Ptr::from_bits(c_addr));
+                let cls_u64: u64 = mem.read(Ptr::from_bits(c_addr + 8));
+                let inst_m_u64: u64 = mem.read(Ptr::from_bits(c_addr + 16));
+                let cls_m_u64: u64 = mem.read(Ptr::from_bits(c_addr + 24));
+                let prot_u64: u64 = mem.read(Ptr::from_bits(c_addr + 32));
+                let prop_u64: u64 = mem.read(Ptr::from_bits(c_addr + 40));
+                let cat32 = category_t {
+                    name: Ptr::from_bits(name_u64 as u32),
+                    class: Ptr::from_bits(cls_u64 as u32),
+                    instance_methods: Ptr::from_bits(inst_m_u64 as u32),
+                    class_methods: Ptr::from_bits(cls_m_u64 as u32),
+                    _protocols: Ptr::from_bits(prot_u64 as u32),
+                    _property_list: Ptr::from_bits(prop_u64 as u32),
+                };
+                let cat_bytes: [u8; 24] = unsafe { std::mem::transmute(cat32) };
+                mem.bytes_at_mut(Ptr::from_bits(c_addr), 24)
+                    .copy_from_slice(&cat_bytes);
+                Ptr::from_bits(c_addr)
+            } else {
+                let base: ConstPtr<ConstPtr<category_t>> = Ptr::from_bits(list.addr);
+                mem.read(base + i)
+            };
+            if cat_ptr.is_null() {
+                continue;
+            }
             let data = mem.read(cat_ptr);
 
             // `category_t` is `#[repr(C, packed)]`, so `data.name` can't be

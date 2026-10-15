@@ -36,6 +36,7 @@ unsafe impl SafeRead for CGPoint {}
 impl_GuestRet_for_large_struct!(CGPoint);
 impl GuestArg for CGPoint {
     const REG_COUNT: usize = 2;
+    const ARM64_CLASS: crate::abi::Arm64ArgClass = crate::abi::Arm64ArgClass::FloatAggregate;
     fn from_regs(regs: &[u32]) -> Self {
         CGPoint {
             x: GuestArg::from_regs(&regs[0..1]),
@@ -113,6 +114,7 @@ unsafe impl SafeRead for CGSize {}
 impl_GuestRet_for_large_struct!(CGSize);
 impl GuestArg for CGSize {
     const REG_COUNT: usize = 2;
+    const ARM64_CLASS: crate::abi::Arm64ArgClass = crate::abi::Arm64ArgClass::FloatAggregate;
     fn from_regs(regs: &[u32]) -> Self {
         CGSize {
             width: GuestArg::from_regs(&regs[0..1]),
@@ -196,6 +198,7 @@ unsafe impl SafeRead for CGRect {}
 impl_GuestRet_for_large_struct!(CGRect);
 impl GuestArg for CGRect {
     const REG_COUNT: usize = 4;
+    const ARM64_CLASS: crate::abi::Arm64ArgClass = crate::abi::Arm64ArgClass::FloatAggregate;
     fn from_regs(regs: &[u32]) -> Self {
         CGRect {
             origin: GuestArg::from_regs(&regs[0..2]),
@@ -799,6 +802,7 @@ unsafe impl SafeRead for CGVector {}
 impl_GuestRet_for_large_struct!(CGVector);
 impl GuestArg for CGVector {
     const REG_COUNT: usize = 2;
+    const ARM64_CLASS: crate::abi::Arm64ArgClass = crate::abi::Arm64ArgClass::FloatAggregate;
     fn from_regs(regs: &[u32]) -> Self {
         CGVector {
             dx: GuestArg::from_regs(&regs[0..1]),

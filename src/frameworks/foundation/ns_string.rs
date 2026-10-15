@@ -2836,16 +2836,32 @@ pub fn register_constant_strings(bin: &MachO, mem: &mut Mem, objc: &mut ObjC) {
     let Some(cfstrings) = bin.get_section("__cfstring") else {
         return;
     };
-    assert!(cfstrings.size % guest_size_of::<cfstringStruct>() == 0);
-    let base: ConstPtr<cfstringStruct> = Ptr::from_bits(cfstrings.addr);
-    for i in 0..(cfstrings.size / guest_size_of::<cfstringStruct>()) {
-        let cfstr_ptr = base + i;
-        let cfstringStruct {
-            _isa,
-            flags,
-            bytes,
-            length,
-        } = mem.read(cfstr_ptr);
+    let entry_stride: u32 = if bin.is_arm64 {
+        32
+    } else {
+        guest_size_of::<cfstringStruct>()
+    };
+    assert!(cfstrings.size % entry_stride == 0);
+    for i in 0..(cfstrings.size / entry_stride) {
+        let entry_addr = cfstrings.addr + i * entry_stride;
+        let cfstr_ptr: ConstPtr<cfstringStruct> = Ptr::from_bits(entry_addr);
+        let (flags, bytes, length) = if bin.is_arm64 {
+            let flags_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 8));
+            let bytes_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 16));
+            let length_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 24));
+            let flags = (flags_u64 & 0xffff_ffff) as u32;
+            let bytes: ConstPtr<u8> = Ptr::from_bits(bytes_u64 as u32);
+            let length: NSUInteger = length_u64 as u32;
+            (flags, bytes, length)
+        } else {
+            let cfstringStruct {
+                _isa,
+                flags,
+                bytes,
+                length,
+            } = mem.read(cfstr_ptr);
+            (flags, bytes, length)
+        };
         let (host_object, class_name) = if flags == 0x7C8 {
             let decoded = String::from_utf8_lossy(mem.bytes_at(bytes, length)).into_owned();
             (
@@ -2880,7 +2896,15 @@ pub fn register_constant_strings(bin: &MachO, mem: &mut Mem, objc: &mut ObjC) {
 
         objc.register_static_object(cfstr_ptr.cast().cast_mut(), Box::new(host_object));
         let new_isa = objc.get_known_class(class_name, mem);
-        mem.write(cfstr_ptr.cast().cast_mut(), new_isa);
+        if bin.is_arm64 {
+            mem.bytes_at_mut(Ptr::from_bits(entry_addr), 32).fill(0);
+            mem.write(Ptr::<Class, true>::from_bits(entry_addr), new_isa);
+            mem.write(Ptr::<u32, true>::from_bits(entry_addr + 4), flags);
+            mem.write(Ptr::<ConstPtr<u8>, true>::from_bits(entry_addr + 8), bytes);
+            mem.write(Ptr::<NSUInteger, true>::from_bits(entry_addr + 12), length);
+        } else {
+            mem.write(cfstr_ptr.cast().cast_mut(), new_isa);
+        }
     }
 }
 

@@ -66,6 +66,7 @@ unsafe impl SafeRead for UIEdgeInsets {}
 crate::abi::impl_GuestRet_for_large_struct!(UIEdgeInsets);
 impl GuestArg for UIEdgeInsets {
     const REG_COUNT: usize = 4;
+    const ARM64_CLASS: crate::abi::Arm64ArgClass = crate::abi::Arm64ArgClass::FloatAggregate;
     fn from_regs(regs: &[u32]) -> Self {
         UIEdgeInsets {
             top: GuestArg::from_regs(&regs[0..1]),

@@ -183,6 +183,21 @@ impl ObjC {
             return;
         };
 
+        if bin.is_arm64 {
+            assert!(selrefs.size % 8 == 0);
+            let base: MutPtr<u64> = Ptr::from_bits(selrefs.addr);
+            for i in 0..(selrefs.size / 8) {
+                let selref = base + i;
+                let raw_ptr = mem.read(selref) as u32;
+                let sel_cstr: ConstPtr<u8> = Ptr::from_bits(raw_ptr);
+
+                if let Some(sel) = self.register_bin_selector(sel_cstr, mem) {
+                    mem.write(selref, sel.0.to_bits() as u64);
+                }
+            }
+            return;
+        }
+
         assert!(selrefs.size % 4 == 0);
         let base: MutPtr<ConstPtr<u8>> = Ptr::from_bits(selrefs.addr);
         for i in 0..(selrefs.size / 4) {

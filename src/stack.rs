@@ -9,33 +9,7 @@ use crate::cpu::Cpu;
 use crate::mem::{GuestUSize, Mem, MutPtr, Ptr};
 
 /// Set up the stack for the main thread, ready to execute the entry-point
-/// of the application (aka `start`).
-///
-/// The entry-point of an iPhone OS application expects certain data to have
-/// been placed on the stack, which it will then pass as arguments to the C
-/// `main` function. On iPhone OS, `main` can have up to four arguments:
-///
-/// ```c
-/// int main(int argc, char *argv[], char *envp[], char *apple[]);
-/// ```
-///
-/// There are two ways an executable's entry point receives these:
-///
-/// * Old-style `LC_UNIXTHREAD`/`LC_THREAD` binaries (iPhone OS 2.x–3.0) jump
-///   to a `start` routine that reads `argc`/`argv`/… off the stack and then
-///   calls `main` itself.
-/// * `LC_MAIN` binaries (iPhone OS 3.1 and later, including the 32-bit App
-///   Store builds touchHLE also targets) have their entry point be the C
-///   `main` function directly; dyld calls it with `argc`, `argv`, `envp` and
-///   `apple` already loaded into `r0`–`r3` per the AAPCS calling convention.
-///
-/// We always lay the data out on the stack (harmless for `LC_MAIN`), and when
-/// `pass_args_in_registers` is set we *also* populate `r0`–`r3` so that an
-/// `LC_MAIN` `main` sees its arguments. Without this, `main` would read
-/// whatever garbage was left in those registers as `argc`/`argv`, which
-/// typically leads to walking an invalid `argv` and crashing very early in
-/// startup (e.g. BioShock aborts inside its allocator while copying the
-/// command line).
+/// of the application (aka `start` or `main`).
 pub fn prep_stack_for_start(
     mem: &mut Mem,
     cpu: &mut Cpu,
@@ -45,20 +19,12 @@ pub fn prep_stack_for_start(
     pass_args_in_registers: bool,
 ) {
     let argc: i32 = argv.len().try_into().unwrap();
+    let is_arm64 = cpu.is_arm64();
+    let ptr_size: u32 = if is_arm64 { 8 } else { 4 };
 
-    // We are arbitrarily putting the main thread's stack at the top of the
-    // address space, but not flush against it: there is a guard region above
-    // it, because a stack object that ends at 0xffffffff runs off the end of
-    // the 32-bit address space and wraps around to zero, which looks exactly
-    // like the guest storing through a NULL pointer (see also:
-    // mem::Mem::MAIN_THREAD_STACK_LOW_END and _GUARD).
-    // Since the stack grows downwards, its first byte would be
-    // Mem::MAIN_THREAD_STACK_HIGH_END.
     let stack_base: usize =
         Mem::MAIN_THREAD_STACK_LOW_END as usize + Mem::MAIN_THREAD_STACK_SIZE as usize;
 
-    // Rust vectors grow upwards but we need to grow this one downwards, so
-    // let's push the strings onto it reversed.
     let mut reversed_data = Vec::<u8>::new();
     let mut string_ptrs = Vec::<u32>::new();
 
@@ -82,6 +48,7 @@ pub fn prep_stack_for_start(
     for arg in argv {
         push_string(arg, &mut reversed_data, &mut string_ptrs, stack_base);
     }
+    string_ptrs.push(0); // terminator
 
     for arg in envp {
         push_string(arg, &mut reversed_data, &mut string_ptrs, stack_base);
@@ -93,17 +60,23 @@ pub fn prep_stack_for_start(
     }
     string_ptrs.push(0); // terminator
 
-    // Pad to ensure stack is 4-byte aligned
-    let misaligned_by = reversed_data.len() % 4;
+    // Pad so the final stack pointer is 16-byte aligned on arm64 (4-byte on arm32).
+    let total_ptr_bytes = string_ptrs.len() * (ptr_size as usize);
+    let align = if is_arm64 { 16 } else { 4 };
+    let misaligned_by = (reversed_data.len() + total_ptr_bytes) % align;
     let pad_by = if misaligned_by != 0 {
-        4 - misaligned_by
+        align - misaligned_by
     } else {
         0
     };
     reversed_data.resize(reversed_data.len() + pad_by, 0);
 
-    for ptr in string_ptrs.iter().rev() {
-        reversed_data.extend_from_slice(ptr.to_be_bytes().as_slice());
+    for &ptr in string_ptrs.iter().rev() {
+        if is_arm64 {
+            reversed_data.extend_from_slice((ptr as u64).to_be_bytes().as_slice());
+        } else {
+            reversed_data.extend_from_slice(ptr.to_be_bytes().as_slice());
+        }
     }
 
     let stack_ptr: MutPtr<u8> =
@@ -118,37 +91,28 @@ pub fn prep_stack_for_start(
         stack_region[i as usize] = reversed_data[(stack_height - i - 1) as usize];
     }
 
-    //println!(
-    //  "{}",
-    //  std::str::from_utf8(
-    //      &stack_region
-    //      .iter()
-    //      .flat_map(|&c| std::ascii::escape_default(c))
-    //      .collect::<Vec<u8>>())
-    //  .unwrap()
-    //);
-    //println!(
-    //    "{:?}",
-    //    mem.cstr_at_utf8(MutPtr::from_bits(mem.read((stack_ptr + 4).cast())))
-    //);
-
-    assert!(stack_height.is_multiple_of(4)); // ensure padding worked properly
+    assert!(stack_height.is_multiple_of(4));
 
     let sp = stack_ptr.to_bits();
     cpu.regs_mut()[Cpu::SP] = sp;
+    if let Some(arm64) = cpu.arm64_mut() {
+        arm64.sp = sp as u64;
+    }
 
     if pass_args_in_registers {
-        // The on-stack layout, from `sp` upwards, is exactly `string_ptrs` in
-        // order: `[argc][argv[0]…argv[argc-1]][NULL][envp…][NULL][apple…][NULL]`.
-        // dyld passes `main` these as `main(argc, argv, envp, apple)`, where
-        // `argv`/`envp`/`apple` are pointers to the respective sub-arrays.
-        let argv_ptr = sp + 4; // skip argc
-        let envp_ptr = argv_ptr + 4 * (argv.len() as u32 + 1); // skip argv + NULL
-        let apple_ptr = envp_ptr + 4 * (envp.len() as u32 + 1); // skip envp + NULL
+        let argv_ptr = sp + ptr_size; // skip argc
+        let envp_ptr = argv_ptr + ptr_size * (argv.len() as u32 + 1); // skip argv + NULL
+        let apple_ptr = envp_ptr + ptr_size * (envp.len() as u32 + 1); // skip envp + NULL
         let regs = cpu.regs_mut();
         regs[0] = argc as u32;
         regs[1] = argv_ptr;
         regs[2] = envp_ptr;
         regs[3] = apple_ptr;
+        if let Some(arm64) = cpu.arm64_mut() {
+            arm64.x[0] = argc as u32 as u64;
+            arm64.x[1] = argv_ptr as u64;
+            arm64.x[2] = envp_ptr as u64;
+            arm64.x[3] = apple_ptr as u64;
+        }
     }
 }

@@ -161,7 +161,9 @@ impl super::ObjC {
         refcount: Option<NonZeroU32>,
     ) -> id {
         let guest_object = objc_object { isa };
-        let ptr: MutPtr<objc_object> = mem.alloc(instance_size).cast();
+        let alloc_size = instance_size.max(8);
+        let ptr: MutPtr<objc_object> = mem.alloc(alloc_size).cast();
+        mem.bytes_at_mut(ptr.cast(), alloc_size).fill(0);
         mem.write(ptr, guest_object);
         self.objects.insert(
             ptr,

@@ -174,6 +174,7 @@ impl ClassHostObject {
         objc: &mut ObjC,
     ) {
         let method_list_t { entsize, count } = mem.read(method_list_ptr);
+        let entsize = entsize & 0xfffc;
         let min_entsize = guest_size_of::<method_t>();
         if entsize < min_entsize {
             log!(
@@ -188,10 +189,21 @@ impl ClassHostObject {
         let methods_base_ptr: ConstPtr<method_t> = (method_list_ptr + 1).cast();
 
         for i in 0..count {
-            let method_ptr: ConstPtr<method_t> =
-                Ptr::from_bits(methods_base_ptr.to_bits() + i * entsize);
-
-            let method_t { name, types, imp } = mem.read(method_ptr);
+            let entry_addr = methods_base_ptr.to_bits() + i * entsize;
+            let (name, types, imp) = if entsize == 24 {
+                let name_u64: u64 = mem.read(Ptr::from_bits(entry_addr));
+                let types_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 8));
+                let imp_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 16));
+                (
+                    Ptr::from_bits(name_u64 as u32),
+                    Ptr::from_bits(types_u64 as u32),
+                    GuestFunction::from_addr_with_thumb_bit(imp_u64 as u32),
+                )
+            } else {
+                let method_ptr: ConstPtr<method_t> = Ptr::from_bits(entry_addr);
+                let method_t { name, types, imp } = mem.read(method_ptr);
+                (name, types, imp)
+            };
 
             // There is no guarantee this string is unique or known.
             // We must deduplicate it like any other.
