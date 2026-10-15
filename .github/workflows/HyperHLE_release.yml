@@ -18,6 +18,10 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
+  # Runs on trunk queue instead of cancelling each other: a cancelled run never
+  # publishes its release, so frequent pushes could otherwise hold releases
+  # back indefinitely. Queued runs start after the previous one finishes and
+  # so see any tag it published.
   cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
 
 jobs:
@@ -31,40 +35,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Initialize pinned git submodules
-        shell: bash
-        run: |
-          git submodule sync --recursive
-          git submodule update --init --recursive
-
-      - name: Ensure pinned SDL source exists
-        shell: bash
-        run: |
-          set -eu
-          SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
-          SDL_DIR=vendor/SDL
-          if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
-            rm -rf "$SDL_DIR"
-            mkdir -p vendor
-            git init "$SDL_DIR"
-            git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
-            git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
-            git -C "$SDL_DIR" checkout --detach FETCH_HEAD
-          fi
-          test -f "$SDL_DIR/CMakeLists.txt"
-          test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
-
-      - name: Ensure OpenAL Soft source exists
-        shell: bash
-        run: |
-          if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
-            echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
-            rm -rf vendor/openal-soft
-            git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
-          fi
-          test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
-
+          
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
 
@@ -95,6 +66,15 @@ jobs:
         run: cargo build --target x86_64-apple-darwin --release  
 
       - name: Create .app bundle and DMG
+        # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
+        # Actions runners with `hdiutil: create failed - Resource busy` when
+        # Spotlight (`mds`/`mds_stores`) decides to index `touchHLE-dmg-src`
+        # at the same moment hdiutil tries to snapshot it, or when a stale
+        # `/Volumes/touchHLE` from a previous run hasn't fully detached.
+        # Mirror the workaround Apple documents in TN2065 / `hdiutil(1)` —
+        # detach any stray attachment, pass `-ov` so an existing image is
+        # overwritten cleanly, and retry a few times. See
+        # <https://developer.apple.com/library/archive/technotes/tn2065/_index.html>.
         run: |
           set -eu
           cd dev-scripts
@@ -104,10 +84,14 @@ jobs:
             "`cargo run --package touchHLE_version -- --branding`"
           mkdir touchHLE-dmg-src
           mv *.app touchHLE-dmg-src/
+          # Forbid Spotlight from indexing the staging folder so it can't
+          # race with hdiutil for an exclusive handle.
           touch touchHLE-dmg-src/.metadata_never_index || true
+          # Tear down any stale mount left over from a previous run.
           if [ -d "/Volumes/touchHLE" ]; then
             hdiutil detach -force "/Volumes/touchHLE" || true
           fi
+          # Retry hdiutil up to 5 times with growing back-off.
           attempt=1
           max_attempts=5
           until hdiutil create -ov -volname touchHLE \
@@ -117,7 +101,7 @@ jobs:
               exit 1
             fi
             sleep_secs=$((attempt * 5))
-            echo "hdiutil create failed (attempt $attempt); retrying in${sleep_secs}s" >&2
+            echo "hdiutil create failed (attempt $attempt); retrying in ${sleep_secs}s" >&2
             if [ -d "/Volumes/touchHLE" ]; then
               hdiutil detach -force "/Volumes/touchHLE" || true
             fi
@@ -142,40 +126,10 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Initialize pinned git submodules
-        shell: bash
-        run: |
-          git submodule sync --recursive
-          git submodule update --init --recursive
-
-      - name: Ensure pinned SDL source exists
-        shell: bash
-        run: |
-          set -eu
-          SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
-          SDL_DIR=vendor/SDL
-          if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
-            rm -rf "$SDL_DIR"
-            mkdir -p vendor
-            git init "$SDL_DIR"
-            git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
-            git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
-            git -C "$SDL_DIR" checkout --detach FETCH_HEAD
-          fi
-          test -f "$SDL_DIR/CMakeLists.txt"
-          test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
-
-      - name: Ensure OpenAL Soft source exists
-        shell: bash
-        run: |
-          if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
-            echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
-            rm -rf vendor/openal-soft
-            git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
-          fi
-          test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
-
       - name: Install Linux build dependencies
+        # SDL2 and openal-soft are built from source (the `static` feature uses
+        # the `bundled` SDL2 build), so the development headers for the audio,
+        # video and input backends they detect must be available.
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
@@ -243,39 +197,6 @@ jobs:
         submodules: recursive
         fetch-depth: 0
         fetch-tags: true
-
-    - name: Initialize pinned git submodules
-      shell: bash
-      run: |
-        git submodule sync --recursive
-        git submodule update --init --recursive
-
-    - name: Ensure pinned SDL source exists
-      shell: bash
-      run: |
-        set -eu
-        SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
-        SDL_DIR=vendor/SDL
-        if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
-          rm -rf "$SDL_DIR"
-          mkdir -p vendor
-          git init "$SDL_DIR"
-          git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
-          git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
-          git -C "$SDL_DIR" checkout --detach FETCH_HEAD
-        fi
-        test -f "$SDL_DIR/CMakeLists.txt"
-        test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
-
-    - name: Ensure OpenAL Soft source exists
-      shell: bash
-      run: |
-        if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
-          echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
-          rm -rf vendor/openal-soft
-          git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
-        fi
-        test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
 
     - name: Cache Rust build artifacts
       uses: actions/cache@main
@@ -355,7 +276,7 @@ jobs:
       run: 7z -oandroid-ndk -snld x android-ndk-r25c-linux.zip  
 
     - name: Link Android NDK  
-      run: ln -s $PWD'/android-ndk/android-ndk-r25c'$ANDROID_SDK_ROOT'/ndk/25.2.9519653'  
+      run: ln -s $PWD'/android-ndk/android-ndk-r25c' $ANDROID_SDK_ROOT'/ndk/25.2.9519653'  
 
     - name: Generate local.properties file  
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
@@ -375,6 +296,13 @@ jobs:
         path: HyperHLE-Fork.apk
 
   build-ios:
+    # The iOS app (platform/ios) and its packaging come from Applesauce
+    # (https://github.com/johnny901901901/Applesauce). This builds the three
+    # unsigned/fakesigned IPAs it ships and uploads each one on its own.
+    #
+    # It waits for check-hyperhle-release only to learn the version a release
+    # build will be tagged with; that job is skipped outside trunk pushes and
+    # manual runs, and the iOS build runs regardless.
     needs: [check-hyperhle-release]
     if: ${{ !cancelled() }}
     runs-on: macos-latest
@@ -386,41 +314,10 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
+          # Full history and tags: the app version comes from the latest
+          # release tag and the build number from the commit count.
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Initialize pinned git submodules
-        shell: bash
-        run: |
-          git submodule sync --recursive
-          git submodule update --init --recursive
-
-      - name: Ensure pinned SDL source exists
-        shell: bash
-        run: |
-          set -eu
-          SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
-          SDL_DIR=vendor/SDL
-          if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
-            rm -rf "$SDL_DIR"
-            mkdir -p vendor
-            git init "$SDL_DIR"
-            git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
-            git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
-            git -C "$SDL_DIR" checkout --detach FETCH_HEAD
-          fi
-          test -f "$SDL_DIR/CMakeLists.txt"
-          test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
-
-      - name: Ensure OpenAL Soft source exists
-        shell: bash
-        run: |
-          if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
-            echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
-            rm -rf vendor/openal-soft
-            git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
-          fi
-          test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
 
       - name: Select the newest installed Xcode
         run: |
@@ -483,6 +380,7 @@ jobs:
           sh platform/ios/scripts/verify-ipa.sh --trollstore dist/HyperHLE-iOS-trollstore.ipa
           sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
 
+      # Each IPA is uploaded as-is rather than wrapped in a zip.
       - uses: actions/upload-artifact@main
         with:
           path: dist/HyperHLE-iOS-unsigned.ipa
@@ -506,40 +404,7 @@ jobs:
       uses: actions/checkout@main
       with:
         submodules: recursive
-
-    - name: Initialize pinned git submodules
-      shell: bash
-      run: |
-        git submodule sync --recursive
-        git submodule update --init --recursive
-
-    - name: Ensure pinned SDL source exists
-      shell: bash
-      run: |
-        set -eu
-        SDL_REVISION=07d0f51fa292895443f563f0cbde4cb3802d87fa
-        SDL_DIR=vendor/SDL
-        if [ ! -f "$SDL_DIR/CMakeLists.txt" ] || [ "$(git -C "$SDL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$SDL_REVISION" ]; then
-          rm -rf "$SDL_DIR"
-          mkdir -p vendor
-          git init "$SDL_DIR"
-          git -C "$SDL_DIR" remote add origin https://github.com/libsdl-org/SDL.git
-          git -C "$SDL_DIR" fetch --depth 1 origin "$SDL_REVISION"
-          git -C "$SDL_DIR" checkout --detach FETCH_HEAD
-        fi
-        test -f "$SDL_DIR/CMakeLists.txt"
-        test "$(git -C "$SDL_DIR" rev-parse HEAD)" = "$SDL_REVISION"
-
-    - name: Ensure OpenAL Soft source exists
-      shell: bash
-      run: |
-        if [ ! -f vendor/openal-soft/CMakeLists.txt ]; then
-          echo "OpenAL Soft submodule is missing; fetching pinned release 1.25.2"
-          rm -rf vendor/openal-soft
-          git clone --depth 1 --branch 1.25.2 https://github.com/kcat/openal-soft.git vendor/openal-soft
-        fi
-        test -f vendor/openal-soft/CMakeLists.txt || { echo "OpenAL Soft source is still missing" >&2; exit 1; }
-
+        
     - name: Cache Rust build artifacts
       uses: Swatinem/rust-cache@master
 
@@ -595,7 +460,7 @@ jobs:
         id: check
         env:
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
-        run: bash ./dev-scripts/hyperhle-should-release.sh
+        run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
     needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
@@ -637,6 +502,8 @@ jobs:
         with:
           name: HyperHLE_Linux_x86_64
           path: artifacts/linux
+      # Unzipped artifacts (upload-artifact archive: false) are documented to
+      # download by their exact file name, so fetch each IPA by name.
       - name: Download iOS unsigned IPA
         uses: actions/download-artifact@main
         with:
@@ -656,17 +523,19 @@ jobs:
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files
         env:
+          # Lets the changelog look up each commit author's GitHub username.
           GH_TOKEN: ${{ github.token }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
           VERSION: ${{ needs.check-hyperhle-release.outputs.version }}
           CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
-        run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_LIMIT"
+        run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
       - name: Publish HyperHLE release
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
+          # Tag the commit that was built, not whatever trunk points at by now.
           target_commitish: ${{ github.sha }}
           name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
