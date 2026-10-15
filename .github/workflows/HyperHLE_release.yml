@@ -460,7 +460,7 @@ jobs:
         id: check
         env:
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
-        run: ./dev-scripts/hyperhle-should-release.sh
+        run: bash ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
     needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
