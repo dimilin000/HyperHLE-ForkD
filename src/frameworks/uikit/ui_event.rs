@@ -1,0 +1,157 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! `UIEvent`.
+
+use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
+use crate::mem::MutVoidPtr;
+use crate::objc::{
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
+};
+use crate::Environment;
+
+type UIEventType = NSUInteger;
+type UIEventSubtype = NSInteger;
+
+const UIEventTypeTouches: UIEventType = 0;
+const UIEventTypePresses: UIEventType = 1;
+const UIEventTypeMotion: UIEventType = 2;
+const UIEventTypeRemoteControl: UIEventType = 4;
+
+const UIEventSubtypeNone: UIEventSubtype = 0;
+const UIEventSubtypeMotionShake: UIEventSubtype = 1;
+const UIEventSubtypeRemoteControlPlay: UIEventSubtype = 100;
+const UIEventSubtypeRemoteControlPause: UIEventSubtype = 101;
+const UIEventSubtypeRemoteControlStop: UIEventSubtype = 102;
+const UIEventSubtypeRemoteControlTogglePlayPause: UIEventSubtype = 103;
+const UIEventSubtypeRemoteControlNextTrack: UIEventSubtype = 104;
+const UIEventSubtypeRemoteControlPreviousTrack: UIEventSubtype = 105;
+const UIEventSubtypeRemoteControlBeginSeekingBackward: UIEventSubtype = 106;
+const UIEventSubtypeRemoteControlEndSeekingBackward: UIEventSubtype = 107;
+const UIEventSubtypeRemoteControlBeginSeekingForward: UIEventSubtype = 108;
+const UIEventSubtypeRemoteControlEndSeekingForward: UIEventSubtype = 109;
+
+#[derive(Default)]
+pub(super) struct UIEventHostObject {
+    /// `NSSet<UITouch*>*`
+    touches: id,
+    timestamp: NSTimeInterval,
+}
+impl HostObject for UIEventHostObject {}
+
+pub const CLASSES: ClassExports = objc_classes! {
+
+(env, this, _cmd);
+
+@implementation UIEvent: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::new(UIEventHostObject {
+        touches: nil,
+        timestamp: 0.0,
+    });
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (())dealloc {
+    let touches = {
+        let host_object = env.objc.borrow_mut::<UIEventHostObject>(this);
+        std::mem::replace(&mut host_object.touches, nil)
+    };
+    release(env, touches);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
+- (NSTimeInterval)timestamp {
+    env.objc.borrow::<UIEventHostObject>(this).timestamp
+}
+
+- (id)touchesForView:(id)view_ {
+    let &UIEventHostObject { touches, .. } = env.objc.borrow(this);
+
+    let touches_for_view: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+
+    let touches_arr: id = msg![env; touches allObjects];
+    let touches_count: NSUInteger = msg![env; touches_arr count];
+    for i in 0..touches_count {
+        let touch: id = msg![env; touches_arr objectAtIndex:i];
+        let view = msg![env; touch view];
+        if view_ == view {
+            let _: () = msg![env; touches_for_view addObject:touch];
+            if !msg![env; view isMultipleTouchEnabled] {
+                break;
+            }
+        }
+    }
+    // `-allObjects` returns an autoreleased array; releasing it here would
+    // over-release it when the pool drains. Apple's -touchesForView: returns
+    // an autoreleased set (+0); ours is +1 from -allocWithZone:, so
+    // autorelease it to match and avoid leaks.
+    autorelease(env, touches_for_view)
+}
+
+- (id)allTouches {
+    let &UIEventHostObject { touches, .. } = env.objc.borrow(this);
+    touches
+}
+
+// Add to @implementation UIEvent:
+
+- (id)touchesForWindow:(id)window {
+    let &UIEventHostObject { touches, .. } = env.objc.borrow(this);
+    let result: id = msg_class![env; NSMutableSet new];
+    let touches_arr: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; touches_arr count];
+    for i in 0..count {
+        let touch: id = msg![env; touches_arr objectAtIndex:i];
+        let touch_view: id = msg![env; touch view];
+        if touch_view != nil {
+            let touch_window: id = msg![env; touch_view window];
+            if touch_window == window {
+                let _: () = msg![env; result addObject:touch];
+            }
+        }
+    }
+    // `-allObjects` returns an autoreleased array; releasing it here would
+    // over-release it when the pool drains. Apple's -touchesForWindow:
+    // returns an autoreleased set (+0); ours is +1 from -new, so autorelease
+    // it to match and avoid leaks.
+    autorelease(env, result)
+}
+
+- (id)touchesForGestureRecognizer:(id)_recognizer {
+    // Return all touches — gesture recognizers are not implemented.
+    let &UIEventHostObject { touches, .. } = env.objc.borrow(this);
+    touches
+}
+
+- (UIEventType)type {
+    UIEventTypeTouches
+}
+
+- (UIEventSubtype)subtype {
+    UIEventSubtypeNone
+}
+
+// TODO: more accessors
+
+@end
+
+};
+
+/// For use by [super::ui_touch]: create a `UIEvent` with a set of `UITouch*`
+pub(super) fn new_event(env: &mut Environment, touches: id) -> id {
+    let event: id = msg_class![env; UIEvent alloc];
+    retain(env, touches);
+    let timestamp: NSTimeInterval = {
+        let process_info = msg_class![env; NSProcessInfo processInfo];
+        msg![env; process_info systemUptime]
+    };
+    let borrow = env.objc.borrow_mut::<UIEventHostObject>(event);
+    borrow.touches = touches;
+    borrow.timestamp = timestamp;
+    event
+}

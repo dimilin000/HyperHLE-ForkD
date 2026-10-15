@@ -38,20 +38,30 @@ jobs:
 
       - name: Ensure submodules, symlinks, and script permissions
         run: |
+          if [ ! -f src/lib.rs ] || [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules and any missing files from upstream..."
+            rm -rf _upstream_submodules
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            mkdir -p vendor
+            for sub in SDL dynarmic libxml2 openal-soft stb; do
+              rm -rf "vendor/$sub"
+              mv "_upstream_submodules/vendor/$sub" "vendor/$sub"
+            done
+            (cd _upstream_submodules && find . -path './.git' -prune -o -type f -print) | while IFS= read -r f; do
+              clean_f="${f#./}"
+              if [ ! -e "$clean_f" ]; then
+                mkdir -p "$(dirname "$clean_f")"
+                cp "_upstream_submodules/$clean_f" "$clean_f" 2>/dev/null || true
+              fi
+            done
+            rm -rf _upstream_submodules
+          fi
           for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
             if [ -f "$f" ]; then
               tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
               chmod +x "$f"
             fi
           done
-          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
-            echo "Populating missing vendor submodules from upstream..."
-            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
-            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
-            mkdir -p vendor
-            cp -R _upstream_submodules/vendor/* vendor/
-            rm -rf _upstream_submodules
-          fi
           if [ -d android/app/src/main ]; then
             rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
                    android/app/src/main/assets/touchHLE_dylibs \
@@ -161,20 +171,30 @@ jobs:
 
       - name: Ensure submodules, symlinks, and script permissions
         run: |
+          if [ ! -f src/lib.rs ] || [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules and any missing files from upstream..."
+            rm -rf _upstream_submodules
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            mkdir -p vendor
+            for sub in SDL dynarmic libxml2 openal-soft stb; do
+              rm -rf "vendor/$sub"
+              mv "_upstream_submodules/vendor/$sub" "vendor/$sub"
+            done
+            (cd _upstream_submodules && find . -path './.git' -prune -o -type f -print) | while IFS= read -r f; do
+              clean_f="${f#./}"
+              if [ ! -e "$clean_f" ]; then
+                mkdir -p "$(dirname "$clean_f")"
+                cp "_upstream_submodules/$clean_f" "$clean_f" 2>/dev/null || true
+              fi
+            done
+            rm -rf _upstream_submodules
+          fi
           for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
             if [ -f "$f" ]; then
               tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
               chmod +x "$f"
             fi
           done
-          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
-            echo "Populating missing vendor submodules from upstream..."
-            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
-            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
-            mkdir -p vendor
-            cp -R _upstream_submodules/vendor/* vendor/
-            rm -rf _upstream_submodules
-          fi
           if [ -d android/app/src/main ]; then
             rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
                    android/app/src/main/assets/touchHLE_dylibs \
@@ -266,20 +286,30 @@ jobs:
 
     - name: Ensure submodules, symlinks, and script permissions
       run: |
+        if [ ! -f src/lib.rs ] || [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+          echo "Populating missing vendor submodules and any missing files from upstream..."
+          rm -rf _upstream_submodules
+          git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+          mkdir -p vendor
+          for sub in SDL dynarmic libxml2 openal-soft stb; do
+            rm -rf "vendor/$sub"
+            mv "_upstream_submodules/vendor/$sub" "vendor/$sub"
+          done
+          (cd _upstream_submodules && find . -path './.git' -prune -o -type f -print) | while IFS= read -r f; do
+            clean_f="${f#./}"
+            if [ ! -e "$clean_f" ]; then
+              mkdir -p "$(dirname "$clean_f")"
+              cp "_upstream_submodules/$clean_f" "$clean_f" 2>/dev/null || true
+            fi
+          done
+          rm -rf _upstream_submodules
+        fi
         for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
           if [ -f "$f" ]; then
             tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
             chmod +x "$f"
           fi
         done
-        if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
-          echo "Populating missing vendor submodules from upstream..."
-          git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
-          rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
-          mkdir -p vendor
-          cp -R _upstream_submodules/vendor/* vendor/
-          rm -rf _upstream_submodules
-        fi
         if [ -d android/app/src/main ]; then
           rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
                  android/app/src/main/assets/touchHLE_dylibs \
@@ -420,20 +450,30 @@ jobs:
 
       - name: Ensure submodules, symlinks, and script permissions
         run: |
+          if [ ! -f src/lib.rs ] || [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules and any missing files from upstream..."
+            rm -rf _upstream_submodules
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            mkdir -p vendor
+            for sub in SDL dynarmic libxml2 openal-soft stb; do
+              rm -rf "vendor/$sub"
+              mv "_upstream_submodules/vendor/$sub" "vendor/$sub"
+            done
+            (cd _upstream_submodules && find . -path './.git' -prune -o -type f -print) | while IFS= read -r f; do
+              clean_f="${f#./}"
+              if [ ! -e "$clean_f" ]; then
+                mkdir -p "$(dirname "$clean_f")"
+                cp "_upstream_submodules/$clean_f" "$clean_f" 2>/dev/null || true
+              fi
+            done
+            rm -rf _upstream_submodules
+          fi
           for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
             if [ -f "$f" ]; then
               tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
               chmod +x "$f"
             fi
           done
-          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
-            echo "Populating missing vendor submodules from upstream..."
-            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
-            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
-            mkdir -p vendor
-            cp -R _upstream_submodules/vendor/* vendor/
-            rm -rf _upstream_submodules
-          fi
           if [ -d android/app/src/main ]; then
             rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
                    android/app/src/main/assets/touchHLE_dylibs \
@@ -540,20 +580,30 @@ jobs:
     - name: Ensure submodules and script permissions
       shell: bash
       run: |
+        if [ ! -f src/lib.rs ] || [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+          echo "Populating missing vendor submodules and any missing files from upstream..."
+          rm -rf _upstream_submodules
+          git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+          mkdir -p vendor
+          for sub in SDL dynarmic libxml2 openal-soft stb; do
+            rm -rf "vendor/$sub"
+            mv "_upstream_submodules/vendor/$sub" "vendor/$sub"
+          done
+          (cd _upstream_submodules && find . -path './.git' -prune -o -type f -print) | while IFS= read -r f; do
+            clean_f="${f#./}"
+            if [ ! -e "$clean_f" ]; then
+              mkdir -p "$(dirname "$clean_f")"
+              cp "_upstream_submodules/$clean_f" "$clean_f" 2>/dev/null || true
+            fi
+          done
+          rm -rf _upstream_submodules
+        fi
         for f in dev-scripts/*.sh; do
           if [ -f "$f" ]; then
             tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
             chmod +x "$f"
           fi
         done
-        if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
-          echo "Populating missing vendor submodules from upstream..."
-          git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
-          rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
-          mkdir -p vendor
-          cp -R _upstream_submodules/vendor/* vendor/
-          rm -rf _upstream_submodules
-        fi
 
     - name: Cache Rust build artifacts
       uses: Swatinem/rust-cache@master
@@ -638,20 +688,30 @@ jobs:
 
       - name: Ensure submodules, symlinks, and script permissions
         run: |
+          if [ ! -f src/lib.rs ] || [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules and any missing files from upstream..."
+            rm -rf _upstream_submodules
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            mkdir -p vendor
+            for sub in SDL dynarmic libxml2 openal-soft stb; do
+              rm -rf "vendor/$sub"
+              mv "_upstream_submodules/vendor/$sub" "vendor/$sub"
+            done
+            (cd _upstream_submodules && find . -path './.git' -prune -o -type f -print) | while IFS= read -r f; do
+              clean_f="${f#./}"
+              if [ ! -e "$clean_f" ]; then
+                mkdir -p "$(dirname "$clean_f")"
+                cp "_upstream_submodules/$clean_f" "$clean_f" 2>/dev/null || true
+              fi
+            done
+            rm -rf _upstream_submodules
+          fi
           for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
             if [ -f "$f" ]; then
               tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
               chmod +x "$f"
             fi
           done
-          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
-            echo "Populating missing vendor submodules from upstream..."
-            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
-            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
-            mkdir -p vendor
-            cp -R _upstream_submodules/vendor/* vendor/
-            rm -rf _upstream_submodules
-          fi
           if [ -d android/app/src/main ]; then
             rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
                    android/app/src/main/assets/touchHLE_dylibs \
