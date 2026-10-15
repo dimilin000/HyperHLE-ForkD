@@ -33,6 +33,8 @@ jobs:
           fetch-tags: true
 
       - name: Force fetch SDL
+
+        shell: bash
         run: |
           rm -rf vendor/SDL
           git clone https://github.com/libsdl-org/SDL.git vendor/SDL
@@ -115,6 +117,8 @@ jobs:
           fetch-tags: true
 
       - name: Force fetch SDL
+
+        shell: bash
         run: |
           rm -rf vendor/SDL
           git clone https://github.com/libsdl-org/SDL.git vendor/SDL
@@ -189,6 +193,8 @@ jobs:
         fetch-tags: true
 
     - name: Force fetch SDL
+
+      shell: bash
       run: |
         rm -rf vendor/SDL
         git clone https://github.com/libsdl-org/SDL.git vendor/SDL
@@ -306,6 +312,8 @@ jobs:
           fetch-tags: true
 
       - name: Force fetch SDL
+
+        shell: bash
         run: |
           rm -rf vendor/SDL
           git clone https://github.com/libsdl-org/SDL.git vendor/SDL
