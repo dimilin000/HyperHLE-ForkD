@@ -8,9 +8,9 @@ on:
         type: boolean
         default: false
   push:
-    branches: [ "trunk" ]
+    branches: [ "trunk", "main" ]
   pull_request:
-    branches: [ "trunk" ]
+    branches: [ "trunk", "main" ]
   create: # for tags
 
 env:
@@ -22,48 +22,81 @@ concurrency:
   # publishes its release, so frequent pushes could otherwise hold releases
   # back indefinitely. Queued runs start after the previous one finishes and
   # so see any tag it published.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' && github.ref != 'refs/heads/main' }}
 
 jobs:
   build-osx:
-    runs-on: macos-latest  
+    runs-on: macos-latest
 
-    steps:  
+    steps:
       - name: Checkout touchHLE
         uses: actions/checkout@main
         with:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
-          
+
+      - name: Ensure submodules, symlinks, and script permissions
+        run: |
+          for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
+            if [ -f "$f" ]; then
+              tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              chmod +x "$f"
+            fi
+          done
+          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules from upstream..."
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
+            mkdir -p vendor
+            cp -R _upstream_submodules/vendor/* vendor/
+            rm -rf _upstream_submodules
+          fi
+          if [ -d android/app/src/main ]; then
+            rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
+                   android/app/src/main/assets/touchHLE_dylibs \
+                   android/app/src/main/assets/touchHLE_fonts \
+                   android/app/src/main/assets/touchHLE_wallpaper.png \
+                   android/app/src/main/res/drawable-nodpi/icon.png \
+                   android/app/src/main/res/drawable-nodpi/icon_preview.png \
+                   android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+            ln -sf ../../../../../touchHLE_default_options.txt android/app/src/main/assets/touchHLE_default_options.txt
+            ln -sf ../../../../../touchHLE_dylibs android/app/src/main/assets/touchHLE_dylibs
+            ln -sf ../../../../../touchHLE_fonts android/app/src/main/assets/touchHLE_fonts
+            ln -sf ../../../../../touchHLE_wallpaper.png android/app/src/main/assets/touchHLE_wallpaper.png
+            ln -sf ../../../../../../res/icon.png android/app/src/main/res/drawable-nodpi/icon.png
+            ln -sf ../../../../../../res/icon_preview.png android/app/src/main/res/drawable-nodpi/icon_preview.png
+            ln -sf ../../../../../../res/icon_unofficial.png android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+          fi
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
 
-      - name: Try to get cached copy of Boost  
-        id: cache-boost  
+      - name: Try to get cached copy of Boost
+        id: cache-boost
         uses: actions/cache@main
-        with:  
-          path: vendor/boost  
-          key: boost_1_81_0_macos  
-          
-      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-        name: Download Boost  
-        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"  
-        
-      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-        name: Extract Boost  
-        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost  
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
         uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~3.29.0"
 
-      - name: Install x86_64 toolchain  
-        run: rustup target add x86_64-apple-darwin  
-        
-      - name: Build  
-        run: cargo build --target x86_64-apple-darwin --release  
+      - name: Install x86_64 toolchain
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Build
+        run: cargo build --target x86_64-apple-darwin --release
 
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
@@ -78,7 +111,7 @@ jobs:
         run: |
           set -eu
           cd dev-scripts
-          ./make-macos-bundle.sh \
+          sh ./make-macos-bundle.sh \
             ../target/x86_64-apple-darwin/release/touchHLE \
             "`cargo run --package touchHLE_version`" \
             "`cargo run --package touchHLE_version -- --branding`"
@@ -109,7 +142,7 @@ jobs:
             attempt=$((attempt + 1))
           done
           mv touchHLE.dmg ..
-          
+
       - uses: actions/upload-artifact@main
         with:
           name: HyperHLE_macOS_x86_64
@@ -125,6 +158,39 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Ensure submodules, symlinks, and script permissions
+        run: |
+          for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
+            if [ -f "$f" ]; then
+              tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              chmod +x "$f"
+            fi
+          done
+          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules from upstream..."
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
+            mkdir -p vendor
+            cp -R _upstream_submodules/vendor/* vendor/
+            rm -rf _upstream_submodules
+          fi
+          if [ -d android/app/src/main ]; then
+            rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
+                   android/app/src/main/assets/touchHLE_dylibs \
+                   android/app/src/main/assets/touchHLE_fonts \
+                   android/app/src/main/assets/touchHLE_wallpaper.png \
+                   android/app/src/main/res/drawable-nodpi/icon.png \
+                   android/app/src/main/res/drawable-nodpi/icon_preview.png \
+                   android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+            ln -sf ../../../../../touchHLE_default_options.txt android/app/src/main/assets/touchHLE_default_options.txt
+            ln -sf ../../../../../touchHLE_dylibs android/app/src/main/assets/touchHLE_dylibs
+            ln -sf ../../../../../touchHLE_fonts android/app/src/main/assets/touchHLE_fonts
+            ln -sf ../../../../../touchHLE_wallpaper.png android/app/src/main/assets/touchHLE_wallpaper.png
+            ln -sf ../../../../../../res/icon.png android/app/src/main/res/drawable-nodpi/icon.png
+            ln -sf ../../../../../../res/icon_preview.png android/app/src/main/res/drawable-nodpi/icon_preview.png
+            ln -sf ../../../../../../res/icon_unofficial.png android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+          fi
 
       - name: Install Linux build dependencies
         # SDL2 and openal-soft are built from source (the `static` feature uses
@@ -180,7 +246,7 @@ jobs:
         run: cargo build --release
 
       - name: Create bundle
-        run: cd dev-scripts && ./make-linux-bundle.sh ../target/release/touchHLE && mv touchHLE_linux_bundle/ ..
+        run: cd dev-scripts && sh ./make-linux-bundle.sh ../target/release/touchHLE && mv touchHLE_linux_bundle/ ..
 
       - uses: actions/upload-artifact@main
         with:
@@ -188,15 +254,48 @@ jobs:
           path: touchHLE_linux_bundle/
 
   build-android:
-    runs-on: ubuntu-latest  
+    runs-on: ubuntu-latest
 
-    steps:  
+    steps:
     - name: Checkout touchHLE
       uses: actions/checkout@main
       with:
         submodules: recursive
         fetch-depth: 0
         fetch-tags: true
+
+    - name: Ensure submodules, symlinks, and script permissions
+      run: |
+        for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
+          if [ -f "$f" ]; then
+            tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            chmod +x "$f"
+          fi
+        done
+        if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+          echo "Populating missing vendor submodules from upstream..."
+          git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+          rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
+          mkdir -p vendor
+          cp -R _upstream_submodules/vendor/* vendor/
+          rm -rf _upstream_submodules
+        fi
+        if [ -d android/app/src/main ]; then
+          rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
+                 android/app/src/main/assets/touchHLE_dylibs \
+                 android/app/src/main/assets/touchHLE_fonts \
+                 android/app/src/main/assets/touchHLE_wallpaper.png \
+                 android/app/src/main/res/drawable-nodpi/icon.png \
+                 android/app/src/main/res/drawable-nodpi/icon_preview.png \
+                 android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+          ln -sf ../../../../../touchHLE_default_options.txt android/app/src/main/assets/touchHLE_default_options.txt
+          ln -sf ../../../../../touchHLE_dylibs android/app/src/main/assets/touchHLE_dylibs
+          ln -sf ../../../../../touchHLE_fonts android/app/src/main/assets/touchHLE_fonts
+          ln -sf ../../../../../touchHLE_wallpaper.png android/app/src/main/assets/touchHLE_wallpaper.png
+          ln -sf ../../../../../../res/icon.png android/app/src/main/res/drawable-nodpi/icon.png
+          ln -sf ../../../../../../res/icon_preview.png android/app/src/main/res/drawable-nodpi/icon_preview.png
+          ln -sf ../../../../../../res/icon_unofficial.png android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+        fi
 
     - name: Cache Rust build artifacts
       uses: actions/cache@main
@@ -208,91 +307,91 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
-          
-    - name: Try to get cached copy of Boost  
-      id: cache-boost  
+
+    - name: Try to get cached copy of Boost
+      id: cache-boost
       uses: actions/cache@main
-      with:  
-        path: vendor/boost  
-        key: boost_1_81_0  
+      with:
+        path: vendor/boost
+        key: boost_1_81_0
 
-    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-      name: Download Boost  
-      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"  
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Download Boost
+      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
 
-    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-      name: Extract Boost  
-      run: 7z -ovendor x boost_1_81_0.7z && mv vendor/boost_1_81_0 vendor/boost  
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Extract Boost
+      run: 7z -ovendor x boost_1_81_0.7z && mv vendor/boost_1_81_0 vendor/boost
 
-    - name: Try to get cached copy of cmake  
-      id: cache-cmake  
+    - name: Try to get cached copy of cmake
+      id: cache-cmake
       uses: actions/cache@main
-      with:  
-        path: vendor/cmake  
-        key: cmake_3_31_6_linux  
+      with:
+        path: vendor/cmake
+        key: cmake_3_31_6_linux
 
-    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}  
-      name: Download Cmake  
-      run: curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz"  
+    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+      name: Download Cmake
+      run: curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz"
 
-    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}  
-      name: Extract Cmake  
-      run: tar xzvf "cmake-3.31.6-linux-x86_64.tar.gz" -C vendor && mv vendor/cmake-3.31.6-linux-x86_64 vendor/cmake  
+    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+      name: Extract Cmake
+      run: tar xzvf "cmake-3.31.6-linux-x86_64.tar.gz" -C vendor && mv vendor/cmake-3.31.6-linux-x86_64 vendor/cmake
 
-    - name: Install AArch64 Android Rust toolchain  
-      run: rustup target add aarch64-linux-android  
+    - name: Install AArch64 Android Rust toolchain
+      run: rustup target add aarch64-linux-android
 
-    - name: Install cargo-ndk  
-      run: cargo install cargo-ndk@3.5.4  
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk@3.5.4
 
-    - name: Try to get a cached copy of Gradle  
-      id: cache-gradle  
+    - name: Try to get a cached copy of Gradle
+      id: cache-gradle
       uses: actions/cache@main
-      with:  
-        path: gradle  
-        key: gradle-8.11.1  
+      with:
+        path: gradle
+        key: gradle-8.11.1
 
-    - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}  
-      name: Download Gradle  
-      run: curl -L -o gradle-8.11.1-bin.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"  
+    - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
+      name: Download Gradle
+      run: curl -L -o gradle-8.11.1-bin.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
 
-    - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}  
-      name: Extract Gradle  
-      run: 7z -ogradle x gradle-8.11.1-bin.zip  
+    - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
+      name: Extract Gradle
+      run: 7z -ogradle x gradle-8.11.1-bin.zip
 
-    - name: Try to get a cached copy of Android NDK  
-      id: cache-android-ndk  
+    - name: Try to get a cached copy of Android NDK
+      id: cache-android-ndk
       uses: actions/cache@main
-      with:  
-        path: android-ndk  
-        key: android-ndk-r25c  
+      with:
+        path: android-ndk
+        key: android-ndk-r25c
 
-    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}  
-      name: Download Android NDK  
-      run: curl -L -o android-ndk-r25c-linux.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"  
+    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+      name: Download Android NDK
+      run: curl -L -o android-ndk-r25c-linux.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
 
-    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}  
-      name: Extract Android NDK  
-      run: 7z -oandroid-ndk -snld x android-ndk-r25c-linux.zip  
+    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+      name: Extract Android NDK
+      run: 7z -oandroid-ndk -snld x android-ndk-r25c-linux.zip
 
-    - name: Link Android NDK  
-      run: ln -s $PWD'/android-ndk/android-ndk-r25c' $ANDROID_SDK_ROOT'/ndk/25.2.9519653'  
+    - name: Link Android NDK
+      run: ln -s $PWD'/android-ndk/android-ndk-r25c' $ANDROID_SDK_ROOT'/ndk/25.2.9519653'
 
-    - name: Generate local.properties file  
-      run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
+    - name: Generate local.properties file
+      run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
 
-    - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk  
-      env:  
+    - name: Build for Android
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk
+      env:
         HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
         HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
         HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
-        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'  
-        CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake  
+        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
+        CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
 
     - uses: actions/upload-artifact@main
-      with:  
-        name: HyperHLE_Android_AArch64  
+      with:
+        name: HyperHLE_Android_AArch64
         path: HyperHLE-Fork.apk
 
   build-ios:
@@ -318,6 +417,39 @@ jobs:
           # release tag and the build number from the commit count.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Ensure submodules, symlinks, and script permissions
+        run: |
+          for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
+            if [ -f "$f" ]; then
+              tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              chmod +x "$f"
+            fi
+          done
+          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules from upstream..."
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
+            mkdir -p vendor
+            cp -R _upstream_submodules/vendor/* vendor/
+            rm -rf _upstream_submodules
+          fi
+          if [ -d android/app/src/main ]; then
+            rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
+                   android/app/src/main/assets/touchHLE_dylibs \
+                   android/app/src/main/assets/touchHLE_fonts \
+                   android/app/src/main/assets/touchHLE_wallpaper.png \
+                   android/app/src/main/res/drawable-nodpi/icon.png \
+                   android/app/src/main/res/drawable-nodpi/icon_preview.png \
+                   android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+            ln -sf ../../../../../touchHLE_default_options.txt android/app/src/main/assets/touchHLE_default_options.txt
+            ln -sf ../../../../../touchHLE_dylibs android/app/src/main/assets/touchHLE_dylibs
+            ln -sf ../../../../../touchHLE_fonts android/app/src/main/assets/touchHLE_fonts
+            ln -sf ../../../../../touchHLE_wallpaper.png android/app/src/main/assets/touchHLE_wallpaper.png
+            ln -sf ../../../../../../res/icon.png android/app/src/main/res/drawable-nodpi/icon.png
+            ln -sf ../../../../../../res/icon_preview.png android/app/src/main/res/drawable-nodpi/icon_preview.png
+            ln -sf ../../../../../../res/icon_unofficial.png android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+          fi
 
       - name: Select the newest installed Xcode
         run: |
@@ -397,53 +529,71 @@ jobs:
           archive: false
 
   build-win:
-    runs-on: windows-2022  
+    runs-on: windows-2022
 
-    steps:  
+    steps:
     - name: Checkout touchHLE
       uses: actions/checkout@main
       with:
         submodules: recursive
-        
+
+    - name: Ensure submodules and script permissions
+      shell: bash
+      run: |
+        for f in dev-scripts/*.sh; do
+          if [ -f "$f" ]; then
+            tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            chmod +x "$f"
+          fi
+        done
+        if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+          echo "Populating missing vendor submodules from upstream..."
+          git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+          rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
+          mkdir -p vendor
+          cp -R _upstream_submodules/vendor/* vendor/
+          rm -rf _upstream_submodules
+        fi
+
     - name: Cache Rust build artifacts
       uses: Swatinem/rust-cache@master
 
-    - name: Try to get cached copy of Boost  
-      id: cache-boost  
+    - name: Try to get cached copy of Boost
+      id: cache-boost
       uses: actions/cache@main
-      with:  
-        path: vendor\boost  
-        key: boost_1_81_0  
-        
-    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-      name: Download Boost  
-      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"  
-      
-    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-      name: Extract Boost  
-      run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost  
+      with:
+        path: vendor\boost
+        key: boost_1_81_0
+
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Download Boost
+      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
+
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Extract Boost
+      run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost
 
     - name: Setup CMake
       uses: lukka/get-cmake@latest
       with:
         cmakeVersion: "~3.29.0"
 
-    - name: Build  
-      run: cargo build --release  
+    - name: Build
+      run: cargo build --release
 
-    - name: Create bundle  
-      shell: bash  
-      run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..  
-      
+    - name: Create bundle
+      shell: bash
+      run: cd dev-scripts && sh ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+
     - uses: actions/upload-artifact@main
-      with:  
-        name: HyperHLE_Windows_x86_64  
+      with:
+        name: HyperHLE_Windows_x86_64
         path: touchHLE_windows_bundle/
 
   check-hyperhle-release:
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
+      (github.event_name == 'push' && (github.ref == 'refs/heads/trunk' || github.ref == 'refs/heads/main')) ||
       github.event_name == 'workflow_dispatch'
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -460,7 +610,10 @@ jobs:
         id: check
         env:
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
-        run: ./dev-scripts/hyperhle-should-release.sh
+        run: |
+          tr -d "\r" < dev-scripts/hyperhle-should-release.sh > dev-scripts/hyperhle-should-release.sh.tmp && mv dev-scripts/hyperhle-should-release.sh.tmp dev-scripts/hyperhle-should-release.sh
+          chmod +x dev-scripts/*.sh 2>/dev/null || true
+          sh ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
     needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
@@ -482,6 +635,39 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Ensure submodules, symlinks, and script permissions
+        run: |
+          for f in dev-scripts/*.sh platform/ios/scripts/*.sh; do
+            if [ -f "$f" ]; then
+              tr -d "\r" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              chmod +x "$f"
+            fi
+          done
+          if [ ! -f vendor/dynarmic/CMakeLists.txt ] || [ ! -f vendor/SDL/CMakeLists.txt ] || [ ! -f vendor/libxml2/CMakeLists.txt ] || [ ! -f vendor/openal-soft/CMakeLists.txt ] || [ ! -f vendor/stb/stb_image.h ]; then
+            echo "Populating missing vendor submodules from upstream..."
+            git clone --depth 1 --recurse-submodules https://github.com/KlugKlugTG/HyperHLE-Fork.git _upstream_submodules
+            rm -rf vendor/SDL vendor/dynarmic vendor/libxml2 vendor/openal-soft vendor/stb
+            mkdir -p vendor
+            cp -R _upstream_submodules/vendor/* vendor/
+            rm -rf _upstream_submodules
+          fi
+          if [ -d android/app/src/main ]; then
+            rm -rf android/app/src/main/assets/touchHLE_default_options.txt \
+                   android/app/src/main/assets/touchHLE_dylibs \
+                   android/app/src/main/assets/touchHLE_fonts \
+                   android/app/src/main/assets/touchHLE_wallpaper.png \
+                   android/app/src/main/res/drawable-nodpi/icon.png \
+                   android/app/src/main/res/drawable-nodpi/icon_preview.png \
+                   android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+            ln -sf ../../../../../touchHLE_default_options.txt android/app/src/main/assets/touchHLE_default_options.txt
+            ln -sf ../../../../../touchHLE_dylibs android/app/src/main/assets/touchHLE_dylibs
+            ln -sf ../../../../../touchHLE_fonts android/app/src/main/assets/touchHLE_fonts
+            ln -sf ../../../../../touchHLE_wallpaper.png android/app/src/main/assets/touchHLE_wallpaper.png
+            ln -sf ../../../../../../res/icon.png android/app/src/main/res/drawable-nodpi/icon.png
+            ln -sf ../../../../../../res/icon_preview.png android/app/src/main/res/drawable-nodpi/icon_preview.png
+            ln -sf ../../../../../../res/icon_unofficial.png android/app/src/main/res/drawable-nodpi/icon_unofficial.png
+          fi
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:
@@ -530,7 +716,7 @@ jobs:
           VERSION: ${{ needs.check-hyperhle-release.outputs.version }}
           CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
-        run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
+        run: sh ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
       - name: Publish HyperHLE release
         uses: softprops/action-gh-release@master
         with:

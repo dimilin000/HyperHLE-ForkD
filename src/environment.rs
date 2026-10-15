@@ -3064,7 +3064,7 @@ impl Environment {
                 };
 
                 if lr_count >= LR_BYPASS_LIMIT {
-                    if crate::libc::cxxabi::unwind_to_app_frame(self) {
+                    if crate::libc::cxxabi::unwind_to_app_frame(self).is_some() {
                         log!(
                             "Warning: {error:?} bypass hit LR_BYPASS_LIMIT at LR={:#x} (PC={:#x}); unwound to outer app frame instead of panicking.",
                             lr,
