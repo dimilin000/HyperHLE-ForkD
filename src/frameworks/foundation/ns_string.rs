@@ -2846,9 +2846,9 @@ pub fn register_constant_strings(bin: &MachO, mem: &mut Mem, objc: &mut ObjC) {
         let entry_addr = cfstrings.addr + i * entry_stride;
         let cfstr_ptr: ConstPtr<cfstringStruct> = Ptr::from_bits(entry_addr);
         let (flags, bytes, length) = if bin.is_arm64 {
-            let flags_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 8));
-            let bytes_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 16));
-            let length_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 24));
+            let flags_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 8));
+            let bytes_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 16));
+            let length_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 24));
             let flags = (flags_u64 & 0xffff_ffff) as u32;
             let bytes: ConstPtr<u8> = Ptr::from_bits(bytes_u64 as u32);
             let length: NSUInteger = length_u64 as u32;

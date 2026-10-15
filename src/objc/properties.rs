@@ -99,11 +99,11 @@ impl ClassHostObject {
             let ivar_ptr: ConstPtr<ivar_t> = Ptr::from_bits(entry_addr);
 
             let (offset, name, type_, alignment, size) = if entsize == 32 {
-                let offset_u64: u64 = mem.read(Ptr::from_bits(entry_addr));
-                let name_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 8));
-                let type_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 16));
-                let align_raw: u32 = mem.read(Ptr::from_bits(entry_addr + 24));
-                let size_raw: u32 = mem.read(Ptr::from_bits(entry_addr + 28));
+                let offset_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr));
+                let name_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 8));
+                let type_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 16));
+                let align_raw: u32 = mem.read(ConstPtr::from_bits(entry_addr + 24));
+                let size_raw: u32 = mem.read(ConstPtr::from_bits(entry_addr + 28));
                 let alignment = 1u32 << align_raw.min(6);
                 (
                     Ptr::from_bits(offset_u64 as u32),
@@ -188,7 +188,7 @@ impl ClassHostObject {
             let prop_ptr: ConstPtr<property_t> = Ptr::from_bits(entry_addr);
 
             let name: ConstPtr<u8> = if entsize == 16 {
-                let name_u64: u64 = mem.read(Ptr::from_bits(entry_addr));
+                let name_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr));
                 Ptr::from_bits(name_u64 as u32)
             } else {
                 let property_t { name, .. } = mem.read(prop_ptr);

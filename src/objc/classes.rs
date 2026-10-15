@@ -766,24 +766,24 @@ impl ObjC {
         if c_addr == 0 || !converted.insert(c_addr) {
             return;
         }
-        let isa_u64: u64 = mem.read(Ptr::from_bits(c_addr));
-        let super_u64: u64 = mem.read(Ptr::from_bits(c_addr + 8));
-        let data_u64: u64 = mem.read(Ptr::from_bits(c_addr + 32));
+        let isa_u64: u64 = mem.read(ConstPtr::from_bits(c_addr));
+        let super_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 8));
+        let data_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 32));
         let isa: Class = Ptr::from_bits(isa_u64 as u32);
         let superclass: Class = Ptr::from_bits(super_u64 as u32);
         let data_addr: u32 = (data_u64 as u32) & !7;
 
         if data_addr != 0 && converted.insert(data_addr) {
-            let flags: u32 = mem.read(Ptr::from_bits(data_addr));
-            let instance_start: u32 = mem.read(Ptr::from_bits(data_addr + 4));
-            let instance_size: u32 = mem.read(Ptr::from_bits(data_addr + 8));
-            let reserved: u32 = mem.read(Ptr::from_bits(data_addr + 12));
-            let name_u64: u64 = mem.read(Ptr::from_bits(data_addr + 24));
-            let base_methods_u64: u64 = mem.read(Ptr::from_bits(data_addr + 32));
-            let base_protocols_u64: u64 = mem.read(Ptr::from_bits(data_addr + 40));
-            let ivars_u64: u64 = mem.read(Ptr::from_bits(data_addr + 48));
-            let weak_ivar_u64: u64 = mem.read(Ptr::from_bits(data_addr + 56));
-            let base_props_u64: u64 = mem.read(Ptr::from_bits(data_addr + 64));
+            let flags: u32 = mem.read(ConstPtr::from_bits(data_addr));
+            let instance_start: u32 = mem.read(ConstPtr::from_bits(data_addr + 4));
+            let instance_size: u32 = mem.read(ConstPtr::from_bits(data_addr + 8));
+            let reserved: u32 = mem.read(ConstPtr::from_bits(data_addr + 12));
+            let name_u64: u64 = mem.read(ConstPtr::from_bits(data_addr + 24));
+            let base_methods_u64: u64 = mem.read(ConstPtr::from_bits(data_addr + 32));
+            let base_protocols_u64: u64 = mem.read(ConstPtr::from_bits(data_addr + 40));
+            let ivars_u64: u64 = mem.read(ConstPtr::from_bits(data_addr + 48));
+            let weak_ivar_u64: u64 = mem.read(ConstPtr::from_bits(data_addr + 56));
+            let base_props_u64: u64 = mem.read(ConstPtr::from_bits(data_addr + 64));
 
             let rw32 = class_rw_t {
                 _flags: flags,
@@ -830,7 +830,7 @@ impl ObjC {
         let mut converted_arm64 = std::collections::HashSet::new();
         for i in 0..total_entries {
             let class: Class = if bin.is_arm64 {
-                let raw: u64 = mem.read(Ptr::from_bits(list.addr + i * 8));
+                let raw: u64 = mem.read(ConstPtr::from_bits(list.addr + i * 8));
                 let cls: Class = Ptr::from_bits(raw as u32);
                 Self::convert_arm64_class_in_place(cls, mem, &mut converted_arm64);
                 cls
@@ -1182,17 +1182,17 @@ impl ObjC {
         assert!(list.size % ptr_stride == 0);
         for i in 0..(list.size / ptr_stride) {
             let cat_ptr: ConstPtr<category_t> = if bin.is_arm64 {
-                let raw: u64 = mem.read(Ptr::from_bits(list.addr + i * 8));
+                let raw: u64 = mem.read(ConstPtr::from_bits(list.addr + i * 8));
                 let c_addr = raw as u32;
                 if c_addr == 0 {
                     continue;
                 }
-                let name_u64: u64 = mem.read(Ptr::from_bits(c_addr));
-                let cls_u64: u64 = mem.read(Ptr::from_bits(c_addr + 8));
-                let inst_m_u64: u64 = mem.read(Ptr::from_bits(c_addr + 16));
-                let cls_m_u64: u64 = mem.read(Ptr::from_bits(c_addr + 24));
-                let prot_u64: u64 = mem.read(Ptr::from_bits(c_addr + 32));
-                let prop_u64: u64 = mem.read(Ptr::from_bits(c_addr + 40));
+                let name_u64: u64 = mem.read(ConstPtr::from_bits(c_addr));
+                let cls_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 8));
+                let inst_m_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 16));
+                let cls_m_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 24));
+                let prot_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 32));
+                let prop_u64: u64 = mem.read(ConstPtr::from_bits(c_addr + 40));
                 let cat32 = category_t {
                     name: Ptr::from_bits(name_u64 as u32),
                     class: Ptr::from_bits(cls_u64 as u32),

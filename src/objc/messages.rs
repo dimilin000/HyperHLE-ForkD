@@ -2452,7 +2452,7 @@ pub(super) fn objc_msgSendSuper2(
         mut class,
     } = env.mem.read(super_ptr);
     if env.cpu.is_arm64() && class == nil {
-        class = env.mem.read(Ptr::from_bits(super_ptr.to_bits() + 8));
+        class = env.mem.read(ConstPtr::from_bits(super_ptr.to_bits() + 8));
     }
     // Rewrite first argument to match the normal ABI.
     crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
@@ -2482,7 +2482,7 @@ pub(super) fn objc_msgSendSuper2_stret(
         mut class,
     } = env.mem.read(super_ptr);
     if env.cpu.is_arm64() && class == nil {
-        class = env.mem.read(Ptr::from_bits(super_ptr.to_bits() + 8));
+        class = env.mem.read(ConstPtr::from_bits(super_ptr.to_bits() + 8));
     }
     // Rewrite second argument (r1) to match the normal stret ABI (r0 = stret, r1 = receiver, r2 = selector).
     env.cpu.regs_mut()[1] = receiver.to_bits();

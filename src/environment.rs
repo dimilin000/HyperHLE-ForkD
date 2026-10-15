@@ -920,7 +920,7 @@ impl Environment {
                                 let func: abi::GuestFunction = if is_bin_arm64 {
                                     let raw: u64 = env
                                         .mem
-                                        .read(mem::Ptr::from_bits(section_addr + i * 8));
+                                        .read(mem::ConstPtr::from_bits(section_addr + i * 8));
                                     abi::GuestFunction::from_addr_with_thumb_bit(raw as u32)
                                 } else {
                                     let base: mem::ConstPtr<abi::GuestFunction> =

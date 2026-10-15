@@ -149,7 +149,7 @@ fn read_next_arg_arm64<T: GuestArg>(
                 *fp_idx += 1;
                 vreg_to_f32(raw)
             } else {
-                let raw: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                let raw: u64 = env.mem.read(ConstPtr::from_bits(sp + *stack_off));
                 *stack_off += 8;
                 vreg_to_f32(raw)
             };
@@ -161,7 +161,7 @@ fn read_next_arg_arm64<T: GuestArg>(
                 *fp_idx += 1;
                 r
             } else {
-                let r: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                let r: u64 = env.mem.read(ConstPtr::from_bits(sp + *stack_off));
                 *stack_off += 8;
                 r
             };
@@ -180,7 +180,7 @@ fn read_next_arg_arm64<T: GuestArg>(
                     *fp_idx += 1;
                     vreg_to_f32(raw)
                 } else {
-                    let raw: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                    let raw: u64 = env.mem.read(ConstPtr::from_bits(sp + *stack_off));
                     *stack_off += 8;
                     vreg_to_f32(raw)
                 };
@@ -193,7 +193,7 @@ fn read_next_arg_arm64<T: GuestArg>(
                 *gp_idx += 1;
                 r
             } else {
-                let r: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                let r: u64 = env.mem.read(ConstPtr::from_bits(sp + *stack_off));
                 *stack_off += 8;
                 r
             };
@@ -207,7 +207,7 @@ fn read_next_arg_arm64<T: GuestArg>(
                     *gp_idx += 1;
                     r
                 } else {
-                    let r: u64 = env.mem.read(Ptr::from_bits(sp + *stack_off));
+                    let r: u64 = env.mem.read(ConstPtr::from_bits(sp + *stack_off));
                     *stack_off += 8;
                     r as u32
                 };
@@ -219,7 +219,8 @@ fn read_next_arg_arm64<T: GuestArg>(
     T::from_regs(&fake_regs[0..T::REG_COUNT])
 }
 
-fn write_next_arg_arm64<T: GuestArg>(
+fn write_next_arg_unified<T: GuestArg>(
+    reg_offset: &mut usize,
     gp_idx: &mut usize,
     fp_idx: &mut usize,
     arg: T,
@@ -228,6 +229,18 @@ fn write_next_arg_arm64<T: GuestArg>(
     let mut fake_regs = [0u32; 16];
     let slice = &mut fake_regs[0..T::REG_COUNT];
     arg.to_regs(slice);
+
+    for &word in slice.iter() {
+        if *reg_offset < 4 {
+            env.cpu.regs_mut()[*reg_offset] = word;
+        } else {
+            let sp = env.cpu.regs()[Cpu::SP];
+            let stack_ptr: MutPtr<u32> = Ptr::from_bits(sp);
+            env.mem
+                .write(stack_ptr + (*reg_offset - 4).try_into().unwrap(), word);
+        }
+        *reg_offset += 1;
+    }
 
     let Some(arm64) = env.cpu.arm64_mut() else {
         return;
@@ -296,9 +309,9 @@ fn write_retval_arm64<R: GuestRet>(retval: R, env: &mut Environment) {
         let scratch_ptr: MutVoidPtr = Ptr::from_bits(scratch_addr);
         retval.to_mem(scratch_ptr, &mut env.mem);
 
-        let word0: u32 = env.mem.read(Ptr::from_bits(scratch_addr));
+        let word0: u32 = env.mem.read(ConstPtr::from_bits(scratch_addr));
         let word1: u32 = if size >= 8 {
-            env.mem.read(Ptr::from_bits(scratch_addr + 4))
+            env.mem.read(ConstPtr::from_bits(scratch_addr + 4))
         } else {
             0
         };
@@ -308,7 +321,7 @@ fn write_retval_arm64<R: GuestRet>(retval: R, env: &mut Environment) {
         let float_count = ((size / 4) as usize).min(4);
         let mut floats = [0.0f64; 4];
         for (i, slot) in floats.iter_mut().enumerate().take(float_count) {
-            let w: u32 = env.mem.read(Ptr::from_bits(scratch_addr + (i as u32) * 4));
+            let w: u32 = env.mem.read(ConstPtr::from_bits(scratch_addr + (i as u32) * 4));
             *slot = f32::from_bits(w) as f64;
         }
 
@@ -322,7 +335,7 @@ fn write_retval_arm64<R: GuestRet>(retval: R, env: &mut Environment) {
         {
             let count = (size / 4) as usize;
             for i in 0..count {
-                let w: u32 = env.mem.read(Ptr::from_bits(scratch_addr + (i as u32) * 4));
+                let w: u32 = env.mem.read(ConstPtr::from_bits(scratch_addr + (i as u32) * 4));
                 let d = f32::from_bits(w) as f64;
                 env.mem
                     .write(Ptr::<u64, true>::from_bits(x8_addr + (i as u32) * 8), d.to_bits());
@@ -493,52 +506,47 @@ macro_rules! impl_CallFromHost {
                 env: &mut Environment,
                 args: ($($P,)*),
             ) -> R {
-                if env.cpu.is_arm64() {
-                    let mut gp_idx = 0;
-                    let mut fp_idx = 0;
-                    $(write_next_arg_arm64::<$P>(&mut gp_idx, &mut fp_idx, args.$p, env);)*
-                }
-
                 let mut reg_offset = 0;
-                let regs = env.cpu.regs_mut();
+                let mut gp_idx = 0;
+                let mut fp_idx = 0;
                 let retval_ptr = R::SIZE_IN_MEM.map(|size| {
                     let aligned_size = (size + 15) & !15;
-                    regs[Cpu::SP] -= aligned_size;
-                    let sp_bits = regs[Cpu::SP];
+                    let sp_bits = {
+                        let regs = env.cpu.regs_mut();
+                        regs[Cpu::SP] -= aligned_size;
+                        regs[Cpu::SP]
+                    };
                     let ptr: ConstVoidPtr = Ptr::from_bits(sp_bits);
                     env.mem
                         .bytes_at_mut(Ptr::from_bits(sp_bits), aligned_size)
                         .fill(0);
-                    write_next_arg(&mut reg_offset, regs, &mut env.mem, ptr);
+                    write_next_arg(&mut reg_offset, env.cpu.regs_mut(), &mut env.mem, ptr);
                     ptr
                 });
 
                 let old_sp = extend_stack_for_args(
                     0 $(+ <$P as GuestArg>::REG_COUNT)*,
-                    regs,
+                    env.cpu.regs_mut(),
                 );
 
-                $(write_next_arg::<$P>(&mut reg_offset, regs, &mut env.mem, args.$p);)*
+                $(write_next_arg_unified::<$P>(&mut reg_offset, &mut gp_idx, &mut fp_idx, args.$p, env);)*
                 self.call_from_guest(env);
 
-                let regs = env.cpu.regs_mut(); // reborrow
-                regs[Cpu::SP] = old_sp;
+                env.cpu.regs_mut()[Cpu::SP] = old_sp;
 
                 if let Some(retval_ptr) = retval_ptr {
                     let aligned_size = (R::SIZE_IN_MEM.unwrap() + 15) & !15;
-                    regs[Cpu::SP] += aligned_size;
-                    if env.cpu.is_arm64() {
-                        if let Some(arm64) = env.cpu.arm64() {
-                            if arm64.stret_scratch_addr != 0 {
-                                let src = env
-                                    .mem
-                                    .bytes_at(Ptr::from_bits(arm64.stret_scratch_addr), R::SIZE_IN_MEM.unwrap())
-                                    .to_vec();
-                                env.mem
-                                    .bytes_at_mut(Ptr::from_bits(retval_ptr.to_bits()), R::SIZE_IN_MEM.unwrap())
-                                    .copy_from_slice(&src);
-                            }
-                        }
+                    env.cpu.regs_mut()[Cpu::SP] += aligned_size;
+                    let scratch_addr = env.cpu.arm64().map_or(0, |a| a.stret_scratch_addr);
+                    if scratch_addr != 0 {
+                        let size = R::SIZE_IN_MEM.unwrap();
+                        let src = env
+                            .mem
+                            .bytes_at(ConstPtr::from_bits(scratch_addr), size)
+                            .to_vec();
+                        env.mem
+                            .bytes_at_mut(MutPtr::from_bits(retval_ptr.to_bits()), size)
+                            .copy_from_slice(&src);
                     }
                     <R as GuestRet>::from_mem(retval_ptr, &env.mem)
                 } else {
@@ -579,25 +587,22 @@ macro_rules! impl_CallFromHost {
 
                 assert!(R::SIZE_IN_MEM.is_none()); // pointer return TODO
 
+                let _ = extend_stack_for_args(
+                    0 $(+ <$P as GuestArg>::REG_COUNT)*,
+                    env.cpu.regs_mut(),
+                );
+
                 if env.cpu.is_arm64() {
                     let sp_now = env.cpu.regs()[Cpu::SP];
                     if let Some(arm64) = env.cpu.arm64_mut() {
                         arm64.sp = sp_now as u64;
                     }
-                    let mut gp_idx = 0;
-                    let mut fp_idx = 0;
-                    $(write_next_arg_arm64::<$P>(&mut gp_idx, &mut fp_idx, args.$p, env);)*
                 }
 
-                let regs = env.cpu.regs_mut();
-
-                let _ = extend_stack_for_args(
-                    0 $(+ <$P as GuestArg>::REG_COUNT)*,
-                    regs,
-                );
-
                 let mut reg_offset = 0;
-                $(write_next_arg::<$P>(&mut reg_offset, regs, &mut env.mem, args.$p);)*
+                let mut gp_idx = 0;
+                let mut fp_idx = 0;
+                $(write_next_arg_unified::<$P>(&mut reg_offset, &mut gp_idx, &mut fp_idx, args.$p, env);)*
 
                 let host_to_guest_stack_frame =
                     env.push_host_to_guest_stack_frame(host_to_guest_frame_pointer);
@@ -740,7 +745,7 @@ impl VaList {
         if env.cpu.is_arm64() {
             let slot_idx = self.reg_offset.saturating_sub(4) as u32;
             let addr = self.stack_pointer.to_bits() + slot_idx * 8;
-            let raw: u64 = env.mem.read(Ptr::from_bits(addr));
+            let raw: u64 = env.mem.read(ConstPtr::from_bits(addr));
             self.reg_offset += 1;
             let mut fake_regs = [0u32; 16];
             if T::REG_COUNT >= 2 {

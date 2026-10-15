@@ -191,9 +191,9 @@ impl ClassHostObject {
         for i in 0..count {
             let entry_addr = methods_base_ptr.to_bits() + i * entsize;
             let (name, types, imp) = if entsize == 24 {
-                let name_u64: u64 = mem.read(Ptr::from_bits(entry_addr));
-                let types_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 8));
-                let imp_u64: u64 = mem.read(Ptr::from_bits(entry_addr + 16));
+                let name_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr));
+                let types_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 8));
+                let imp_u64: u64 = mem.read(ConstPtr::from_bits(entry_addr + 16));
                 (
                     Ptr::from_bits(name_u64 as u32),
                     Ptr::from_bits(types_u64 as u32),
