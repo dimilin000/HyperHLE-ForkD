@@ -1,0 +1,166 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+[workspace]
+members = ["platform/ios/rust-entry"]
+
+[workspace.package]
+version = "0.2.3"
+edition = "2021"
+license = "MPL-2.0"
+authors = ["touchHLE project contributors"]
+
+[package]
+name = "touchHLE"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+
+[lib]
+# https://users.rust-lang.org/t/making-both-binary-and-cdylib-from-one-package/29105
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "touchHLE"
+path = "src/bin.rs"
+
+[features]
+default = ["static"]
+static = [
+    "sdl2/bundled",
+    "sdl2/static-link",
+    "touchHLE_openal_soft_wrapper/static",
+    "touchHLE_libxml2_wrapper/static",
+]
+# Like "static", but SDL2 is linked dynamically against a shared library
+# supplied by the host. The iOS host app loads a core as a dylib at runtime, and
+# SDL owns the process entry point and the UIApplicationDelegate, so the app and
+# the core have to be the same SDL — a core cannot bring its own copy.
+dynamic-sdl = [
+    "touchHLE_openal_soft_wrapper/static",
+    "touchHLE_libxml2_wrapper/static",
+]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace.dependencies]
+cc = "1.0.83"
+cmake = "0.1.49"
+gl_generator = "0.14.0"
+
+[dependencies]
+caf = "0.1.0" # ИСПРАВЛЕНИЕ: Добавлен недостающий крейт
+hound = "3.5.0"
+openh264 = { version = "0.9.8", default-features = false, features = ["source"] }
+mach_object = "0.1.17"
+plist = "1.8.0"
+zip = { version = "0.6.4", default-features = false, features = ["deflate"] }
+rusttype = "0.9.3"
+# While most Symphonia codecs are (likely) unpatented/have freely licenseable 
+# patents as of 2024, all of the AAC profiles except AAC-LC (likely) have 
+# active patent claims. The "aac" feature only enables AAC-LC, so it's should 
+# be ok.
+# (The above statements should not understood as legal claims/advice.)
+symphonia = { version = "0.6.0", default-features = false, features = [
+    # formats
+    "aiff", "caf", "isomp4", "wav",
+    # codecs
+    "aac", "adpcm", "alac", "mp3", "pcm",
+    # standalone metadata readers
+    #
+    # These MUST be enabled explicitly because `default-features = false`
+    # drops upstream's `all-meta` (which is part of Symphonia's own default
+    # feature set). Without `id3v2` the `Id3v2Reader` is never registered
+    # with the default `Probe` (`symphonia/src/lib.rs` gates the
+    # registration behind `#[cfg(feature = "id3v2")]`), and probing an
+    # ID3v2-tagged MP3 then degenerates into a byte-by-byte scan of the raw
+    # tag looking for an MPEG frame sync. That scan is capped by
+    # `ProbeOptions::max_probe_depth` (1 MiB) and false-matches freely
+    # inside embedded cover art, so tagged MP3s frequently fail to open at
+    # all. Note that `Probe::next()` ignores its `Hint` argument entirely in
+    # 0.6.0, so this cannot be worked around by hinting the format at the
+    # call site — the reader has to be registered.
+    #
+    # Enabling these adds no new crates to the dependency graph:
+    # `symphonia-metadata` is an unconditional dependency of `symphonia`
+    # (its `embedded` module is always re-exported) and `ape`/`id3v1`/`id3v2`
+    # are plain cfg flags inside it, so `Cargo.lock` is unchanged.
+    "ape", "id3v1", "id3v2", "exp-video-codecs"
+] }
+quick-xml = "0.38.4"
+# PERF: use mimalloc as the global allocator (see src/lib.rs).
+# PIN: the `v2` feature is required. Without it, libmimalloc-sys 0.1.49 builds
+# mimalloc v3 (locked resolution: v3.3.2), which has an upstream-confirmed
+# multithreading crash class in 3.3.0-3.3.2 (microsoft/mimalloc #1287, #1288:
+# `_mi_malloc_generic` SIGSEGVs after the main thread is misidentified and
+# reclaimed; fixed only in the still-churning 3.4/3.5 line). The symbolicated
+# Real Racing 3 Android crash lands in exactly that path. Stay on the
+# maintained v2 branch (v2.3.2) until v3 is proven stable.
+mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
+digest = "0.10.7"
+md-5 = "0.10.6"
+sha1 = "0.10.6"
+sha2 = "0.10.8"
+encoding_rs = "0.8.35"
+# We currently use a fork of rust-sdl2 because we need a fix for Android builds
+# that's not upstream yet.
+# The HIDAPI feature is enabled because rust-sdl2 hides the SDL2 sensor features
+# behind this, but the actual HIDAPI is not used by touchHLE (see window.rs).
+# Note that the submodule in vendor/SDL2/ must use exactly the same revision of
+# SDL2 that rust-sdl2 uses, so that the Android JNI interface matches.
+sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi"] }
+sdl2-sys = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3" }
+touchHLE_dynarmic_wrapper = { path = "src/cpu/dynarmic_wrapper" }
+touchHLE_gl_bindings = { path = "src/gles/gl_bindings" }
+touchHLE_libxml2_wrapper = { path = "src/frameworks/libxml2_wrapper" }
+touchHLE_openal_soft_wrapper = { path = "src/audio/openal_soft_wrapper" }
+touchHLE_pvrt_decompress_wrapper = { path = "src/image/pvrt_decompress_wrapper" }
+touchHLE_stb_image_wrapper = { path = "src/image/stb_image_wrapper" }
+touchHLE_version = { path = "src/version" }
+windows-sys = { version = "0.61.0", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+] }
+nibarchive = "0.1.0"
+libc = "0.2.180"
+corosensei = "0.3.2"
+rusqlite = { version = "0.29.0", features = ["bundled"] }
+lazy_static = "1.4.0"
+regex = "1.10.0"
+bzip2 = "0.4"
+# Blocking HTTP client used to give NSURLConnection / NSURLSession real
+# networking (pure-Rust TLS via rustls, so no system OpenSSL dependency).
+ureq = { version = "2.9", features = ["tls", "gzip"] }
+
+[build-dependencies]
+cargo-license = "0.5.1"
+cc = { workspace = true }
+cmake = { workspace = true }
+gl_generator = { workspace = true }
+
+# Game startup is CPU-bound, so optimize Dynarmic in debug runs without optimizing all Rust code.
+[profile.dev.package.touchHLE_dynarmic_wrapper]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+# PERF: fat (whole-program) LTO instead of thin LTO. The emulator's hottest
+# paths span crate boundaries (the main crate calls into the dynarmic/gl
+# wrapper crates on every guest memory access, host function dispatch, etc.),
+# and fat LTO lets LLVM inline across all of them. Slower link times, but a
+# consistent few-percent win in emulation-heavy workloads.
+lto = "fat"
+# NOTE: binaries are intentionally NOT stripped: the symbol table is what
+# makes crash-handler backtraces readable, and both CI and the Android build
+# already discard debug info through other means.
+
+# Patched copy of symphonia-codec-aac 0.6.0: its AAC section-data parser can
+# index out of bounds (len 64, index 64) on unusual but valid streams and
+# panic, taking down the whole emulator. The vendored copy under
+# vendor/symphonia-codec-aac turns that into a recoverable decode error.
+[patch.crates-io]
+symphonia-codec-aac = { path = "vendor/symphonia-codec-aac" }

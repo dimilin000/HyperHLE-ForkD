@@ -1,0 +1,388 @@
+From f488f760c69c42a97331961e8e6c359b46ccc9e9 Mon Sep 17 00:00:00 2001
+From: johnny901901901 <jonathankelsey100@gmail.com>
+Date: Sun, 2 Aug 2026 02:13:16 +0100
+Subject: [PATCH] Support the iOS arm64 JIT host
+
+Changes needed to run dynarmic's arm64 backend inside a signed iOS app,
+where the JIT region must be mapped with MAP_JIT and toggled between
+writable and executable rather than being RWX.
+
+- oaknut CodeBlock: allocate with MAP_JIT and switch write/execute
+  protection around code generation on Apple platforms.
+- address_space / a32_address_space: apply the same protection dance
+  around block emission and patching.
+- spin_lock_arm64: use the Apple-compatible sequence.
+- block_range_information: replace boost::icl::interval_map with a plain
+  std::map of discrete intervals. The interval_map instantiation does not
+  build against the Boost version used for the iOS toolchain.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../oaknut/include/oaknut/code_block.hpp      | 131 +++++++++++++++++-
+ .../backend/arm64/a32_address_space.cpp       |   1 +
+ src/dynarmic/backend/arm64/address_space.cpp  |   6 +-
+ .../backend/block_range_information.cpp       |  15 +-
+ .../backend/block_range_information.h         |   6 +-
+ src/dynarmic/common/spin_lock_arm64.cpp       |  20 +++
+ 6 files changed, 162 insertions(+), 17 deletions(-)
+
+diff --git a/externals/oaknut/include/oaknut/code_block.hpp b/externals/oaknut/include/oaknut/code_block.hpp
+index bfa87d96..559f7caa 100644
+--- a/externals/oaknut/include/oaknut/code_block.hpp
++++ b/externals/oaknut/include/oaknut/code_block.hpp
+@@ -14,6 +14,8 @@
+ #elif defined(__APPLE__)
+ #    include <TargetConditionals.h>
+ #    include <libkern/OSCacheControl.h>
++#    include <mach/mach.h>
++#    include <mach/vm_map.h>
+ #    include <pthread.h>
+ #    include <sys/mman.h>
+ #    include <unistd.h>
+@@ -23,6 +25,41 @@
+ 
+ namespace oaknut {
+ 
++#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++namespace detail {
++
++struct ReusableJitRegion {
++    std::uint32_t* memory = nullptr;
++    std::uint32_t* writable_memory = nullptr;
++    std::size_t size = 0;
++    bool in_use = false;
++};
++
++inline ReusableJitRegion& reusable_jit_region()
++{
++    static ReusableJitRegion region;
++    return region;
++}
++
++__attribute__((noinline, optnone, naked)) static void* prepare_jit_region(void*, std::size_t)
++{
++    __asm__ volatile(
++        "mov x16, #1\n"
++        "brk #0xf00d\n"
++        "ret\n");
++}
++
++__attribute__((noinline, optnone, naked)) static void detach_jit_server()
++{
++    __asm__ volatile(
++        "mov x16, #0\n"
++        "brk #0xf00d\n"
++        "ret\n");
++}
++
++}  // namespace detail
++#endif
++
+ class CodeBlock {
+ public:
+     explicit CodeBlock(std::size_t size)
+@@ -31,7 +68,47 @@ public:
+ #if defined(_WIN32)
+         m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+ #elif defined(__APPLE__)
+-#    if TARGET_OS_IPHONE
++#    if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++        auto& reusable_region = detail::reusable_jit_region();
++        if (reusable_region.memory != nullptr) {
++            if (reusable_region.in_use || reusable_region.size != size)
++                throw std::bad_alloc{};
++
++            m_memory = reusable_region.memory;
++            m_wmemory = reusable_region.writable_memory;
++            reusable_region.in_use = true;
++        } else {
++            m_memory = (std::uint32_t*)detail::prepare_jit_region(nullptr, size);
++            if (m_memory == nullptr)
++                throw std::bad_alloc{};
++
++            vm_prot_t current_protection;
++            vm_prot_t maximum_protection;
++            kern_return_t result = vm_remap(mach_task_self(),
++                                            reinterpret_cast<vm_address_t*>(&m_wmemory),
++                                            size,
++                                            0,
++                                            VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
++                                            mach_task_self(),
++                                            reinterpret_cast<mach_vm_address_t>(m_memory),
++                                            false,
++                                            &current_protection,
++                                            &maximum_protection,
++                                            VM_INHERIT_NONE);
++            if (result != KERN_SUCCESS ||
++                vm_protect(mach_task_self(),
++                           reinterpret_cast<vm_address_t>(m_wmemory),
++                           size,
++                           false,
++                           VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
++                munmap(m_memory, size);
++                throw std::bad_alloc{};
++            }
++
++            reusable_region = {m_memory, m_wmemory, size, true};
++            m_should_detach_jit_server = true;
++        }
++#    elif TARGET_OS_IPHONE
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+ #    else
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+@@ -44,8 +121,18 @@ public:
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+ #endif
+ 
++#if defined(_WIN32)
+         if (m_memory == nullptr)
++#elif defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++        if (m_memory == nullptr || m_wmemory == nullptr)
++#else
++        if (m_memory == MAP_FAILED)
++#endif
+             throw std::bad_alloc{};
++
++#if !(defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR)
++        m_wmemory = m_memory;
++#endif
+     }
+ 
+     ~CodeBlock()
+@@ -56,6 +143,14 @@ public:
+ #if defined(_WIN32)
+         VirtualFree((void*)m_memory, 0, MEM_RELEASE);
+ #else
++#    if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++        auto& reusable_region = detail::reusable_jit_region();
++        if (reusable_region.memory == m_memory && reusable_region.writable_memory == m_wmemory) {
++            reusable_region.in_use = false;
++            return;
++        }
++        munmap(m_wmemory, m_size);
++#    endif
+         munmap(m_memory, m_size);
+ #endif
+     }
+@@ -70,11 +165,23 @@ public:
+         return m_memory;
+     }
+ 
++    std::uint32_t* wptr() const
++    {
++        return m_wmemory;
++    }
++
++    std::uint32_t* xptr() const
++    {
++        return m_memory;
++    }
++
+     void protect()
+     {
+ #if defined(__APPLE__) && !TARGET_OS_IPHONE
+         pthread_jit_write_protect_np(1);
+-#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
++#elif defined(__APPLE__) && TARGET_OS_IPHONE && TARGET_OS_SIMULATOR
++        mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);
++#elif defined(__NetBSD__) || defined(__OpenBSD__)
+         mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);
+ #endif
+     }
+@@ -83,11 +190,23 @@ public:
+     {
+ #if defined(__APPLE__) && !TARGET_OS_IPHONE
+         pthread_jit_write_protect_np(0);
+-#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
++#elif defined(__APPLE__) && TARGET_OS_IPHONE && TARGET_OS_SIMULATOR
++        mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);
++#elif defined(__NetBSD__) || defined(__OpenBSD__)
+         mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);
+ #endif
+     }
+ 
++    void detach_jit_server()
++    {
++#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++        if (m_should_detach_jit_server) {
++            m_should_detach_jit_server = false;
++            detail::detach_jit_server();
++        }
++#endif
++    }
++
+     void invalidate(std::uint32_t* mem, std::size_t size)
+     {
+ #if defined(__APPLE__)
+@@ -136,8 +255,12 @@ public:
+     }
+ 
+ protected:
+-    std::uint32_t* m_memory;
++    std::uint32_t* m_memory = nullptr;
++    std::uint32_t* m_wmemory = nullptr;
+     std::size_t m_size = 0;
++#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++    bool m_should_detach_jit_server = false;
++#endif
+ };
+ 
+ }  // namespace oaknut
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925f..848359a0 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -159,6 +159,7 @@ A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
+         : AddressSpace(conf.code_cache_size)
+         , conf(conf) {
+     EmitPrelude();
++    mem.detach_jit_server();
+ }
+ 
+ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..d48fc927 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -23,7 +23,7 @@ namespace Dynarmic::Backend::Arm64 {
+ AddressSpace::AddressSpace(size_t code_cache_size)
+         : code_cache_size(code_cache_size)
+         , mem(code_cache_size)
+-        , code(mem.ptr(), mem.ptr())
++        , code(mem.wptr(), mem.xptr())
+         , fastmem_manager(exception_handler) {
+     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
+ 
+@@ -136,7 +136,7 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, target] : block_info.relocations) {
+-        CodeGenerator c{mem.ptr(), mem.ptr()};
++        CodeGenerator c{mem.wptr(), mem.xptr()};
+         c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
+ 
+         switch (target) {
+@@ -276,7 +276,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, type] : block_relocations_list) {
+-        CodeGenerator c{mem.ptr(), mem.ptr()};
++        CodeGenerator c{mem.wptr(), mem.xptr()};
+         c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+ 
+         switch (type) {
+diff --git a/src/dynarmic/backend/block_range_information.cpp b/src/dynarmic/backend/block_range_information.cpp
+index 47e512f5..d24840ac 100644
+--- a/src/dynarmic/backend/block_range_information.cpp
++++ b/src/dynarmic/backend/block_range_information.cpp
+@@ -5,7 +5,6 @@
+ 
+ #include "dynarmic/backend/block_range_information.h"
+ 
+-#include <boost/icl/interval_map.hpp>
+ #include <boost/icl/interval_set.hpp>
+ #include <mcl/stdint.hpp>
+ #include <tsl/robin_set.h>
+@@ -14,7 +13,7 @@ namespace Dynarmic::Backend {
+ 
+ template<typename ProgramCounterType>
+ void BlockRangeInformation<ProgramCounterType>::AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location) {
+-    block_ranges.add(std::make_pair(range, std::set<IR::LocationDescriptor>{location}));
++    block_ranges.insert_or_assign(location, range);
+ }
+ 
+ template<typename ProgramCounterType>
+@@ -25,15 +24,17 @@ void BlockRangeInformation<ProgramCounterType>::ClearCache() {
+ template<typename ProgramCounterType>
+ tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>::InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges) {
+     tsl::robin_set<IR::LocationDescriptor> erase_locations;
+-    for (auto invalidate_interval : ranges) {
+-        auto pair = block_ranges.equal_range(invalidate_interval);
+-        for (auto it = pair.first; it != pair.second; ++it) {
+-            for (const auto& descriptor : it->second) {
++    for (const auto& [descriptor, block_range] : block_ranges) {
++        for (const auto& invalidate_interval : ranges) {
++            if (boost::icl::intersects(block_range, invalidate_interval)) {
+                 erase_locations.insert(descriptor);
++                break;
+             }
+         }
+     }
+-    // TODO: EFFICIENCY: Remove ranges that are to be erased.
++    for (const auto& descriptor : erase_locations) {
++        block_ranges.erase(descriptor);
++    }
+     return erase_locations;
+ }
+ 
+diff --git a/src/dynarmic/backend/block_range_information.h b/src/dynarmic/backend/block_range_information.h
+index 3402b155..e8b80ca6 100644
+--- a/src/dynarmic/backend/block_range_information.h
++++ b/src/dynarmic/backend/block_range_information.h
+@@ -5,9 +5,9 @@
+ 
+ #pragma once
+ 
+-#include <set>
++#include <map>
+ 
+-#include <boost/icl/interval_map.hpp>
++#include <boost/icl/discrete_interval.hpp>
+ #include <boost/icl/interval_set.hpp>
+ #include <tsl/robin_set.h>
+ 
+@@ -23,7 +23,7 @@ public:
+     tsl::robin_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
+ 
+ private:
+-    boost::icl::interval_map<ProgramCounterType, std::set<IR::LocationDescriptor>> block_ranges;
++    std::map<IR::LocationDescriptor, boost::icl::discrete_interval<ProgramCounterType>> block_ranges;
+ };
+ 
+ }  // namespace Dynarmic::Backend
+diff --git a/src/dynarmic/common/spin_lock_arm64.cpp b/src/dynarmic/common/spin_lock_arm64.cpp
+index ccf807e2..bbd96c5f 100644
+--- a/src/dynarmic/common/spin_lock_arm64.cpp
++++ b/src/dynarmic/common/spin_lock_arm64.cpp
+@@ -5,6 +5,10 @@
+ 
+ #include <mutex>
+ 
++#if defined(__APPLE__)
++#    include <TargetConditionals.h>
++#endif
++
+ #include <oaknut/code_block.hpp>
+ #include <oaknut/oaknut.hpp>
+ 
+@@ -13,6 +17,20 @@
+ 
+ namespace Dynarmic {
+ 
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++
++void SpinLock::Lock() {
++    while (__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE)) {
++        __asm__ volatile("yield");
++    }
++}
++
++void SpinLock::Unlock() {
++    __atomic_store_n(&storage, 0, __ATOMIC_RELEASE);
++}
++
++#else
++
+ using Backend::Arm64::Wscratch0;
+ using Backend::Arm64::Wscratch1;
+ using namespace oaknut::util;
+@@ -83,4 +101,6 @@ void SpinLock::Unlock() {
+     impl.unlock(&storage);
+ }
+ 
++#endif
++
+ }  // namespace Dynarmic
+-- 
+2.43.0
+

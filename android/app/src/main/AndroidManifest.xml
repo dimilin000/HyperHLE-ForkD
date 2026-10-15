@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this
+   - file, You can obtain one at https://mozilla.org/MPL/2.0/.
+   -
+   - Parts of this file are derived from SDL 2's Android project template, which
+   - has a different license. Please see vendor/SDL/LICENSE.txt for details. -->
+
+<!-- Replace com.test.game with the identifier of your game below, e.g.
+     com.gamemaker.game
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:installLocation="auto"
+    android:versionCode="1">
+
+    <!-- Touchscreen support -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!-- Game controller support -->
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.gamepad"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- mDNS/Bonjour LAN discovery: MainActivity.onCreate() acquires a Wi-Fi
+         multicast lock, because Android Wi-Fi drivers drop multicast unless
+         an app holds one (GameKit / NSNetService / Gameloft LAN servers need
+         it). Acquiring the lock without declaring this permission throws a
+         SecurityException on every launch, so the lock was never actually
+         held and LAN discovery stayed broken. It is a normal (install-time)
+         permission: no runtime prompt, no user-visible change. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.camera.front"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
+    <!-- External mouse input events -->
+    <uses-feature
+        android:name="android.hardware.type.pc"
+        android:required="false" />
+
+    <!-- Audio recording support -->
+    <!-- if you want to capture audio, uncomment this. -->
+    <!-- <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" /> -->
+
+    <!-- Allow downloading to the external storage on Android 5.1 and older -->
+    <!-- <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="22" /> -->
+
+    <!-- Allow access to Bluetooth devices -->
+    <!-- Currently this is just for Steam Controller support and requires setting SDL_HINT_JOYSTICK_HIDAPI_STEAM -->
+    <!-- <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" /> -->
+    <!-- <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" /> -->
+
+    <!-- Allow access to the vibrator -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Real camera + microphone passthrough (see HostMedia.java). The
+         camera feature is declared non-required so installs still work on
+         devices without cameras (they get the "no camera" fallback). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:hardwareAccelerated="true"
+        android:icon="${icon}"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <!-- Example of setting SDL hints from AndroidManifest.xml:
+        <meta-data android:name="SDL_ENV.SDL_ACCELEROMETER_AS_JOYSTICK" android:value="0"/>
+         -->
+
+        <!--
+          Note: the platform's `com.android.graphics.driver.prefer_angle`
+          opt-in is deliberately NOT declared. HyperHLE uses its bundled ANGLE
+          libraries directly whenever they are available; see
+          `configure_android_angle_driver` in `src/window.rs`. Declaring the
+          platform opt-in could substitute the system's ANGLE driver on
+          Android 15+ instead of the bundled libraries.
+        -->
+
+        <activity
+            android:name="org.touchhle.android.MainActivity"
+            android:alwaysRetainTaskState="true"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:exported="true"
+            android:launchMode="singleInstance"
+            android:preferMinimalPostProcessing="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Let Android know that we can handle some USB devices and should receive this event -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <!-- Drop file event -->
+            <!--
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            -->
+        </activity>
+
+        <provider
+            android:name="org.touchhle.android.DocumentsProvider"
+            android:authorities="${applicationId}.provider"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:icon="${icon}"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+    </application>
+
+</manifest>

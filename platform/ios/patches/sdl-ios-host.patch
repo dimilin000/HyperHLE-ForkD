@@ -1,0 +1,399 @@
+From 043ddb7af6555f0765ea30845855fa932ac7ab98 Mon Sep 17 00:00:00 2001
+From: johnny901901901 <58041188+johnny901901901@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 08:40:58 +0100
+Subject: [PATCH] Support touchHLE iOS host scenes
+
+---
+ CMakeLists.txt                         |   2 +-
+ include/SDL_config_iphoneos.h          |   2 +-
+ src/misc/ios/SDL_sysurl.m              |   9 +-
+ src/video/uikit/SDL_uikitappdelegate.h |   9 ++
+ src/video/uikit/SDL_uikitappdelegate.m | 162 ++++++++++++++++++++++++-
+ src/video/uikit/SDL_uikitopenglview.m  |   5 +
+ src/video/uikit/SDL_uikitvideo.m       |   6 +
+ src/video/uikit/SDL_uikitwindow.m      |  60 ++++++++-
+ 8 files changed, 246 insertions(+), 9 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e2eeaed64..d461e0f53 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2150,7 +2150,7 @@ elseif(APPLE)
+       set(SDL_FRAMEWORK_QUARTZCORE 1)
+       set(SDL_FRAMEWORK_UIKIT 1)
+       set(SDL_IPHONE_KEYBOARD 1)
+-      set(SDL_IPHONE_LAUNCHSCREEN 1)
++      set(SDL_IPHONE_LAUNCHSCREEN 0)
+       file(GLOB UIKITVIDEO_SOURCES ${SDL2_SOURCE_DIR}/src/video/uikit/*.m)
+       list(APPEND SOURCE_FILES ${UIKITVIDEO_SOURCES})
+       set(HAVE_SDL_VIDEO TRUE)
+diff --git a/include/SDL_config_iphoneos.h b/include/SDL_config_iphoneos.h
+index 02011c4c8..da777097a 100644
+--- a/include/SDL_config_iphoneos.h
++++ b/include/SDL_config_iphoneos.h
+@@ -209,7 +209,7 @@
+ #define SDL_IPHONE_KEYBOARD 1
+ 
+ /* enable iOS extended launch screen */
+-#define SDL_IPHONE_LAUNCHSCREEN 1
++#define SDL_IPHONE_LAUNCHSCREEN 0
+ 
+ /* enable filesystem support */
+ #define SDL_FILESYSTEM_COCOA   1
+diff --git a/src/misc/ios/SDL_sysurl.m b/src/misc/ios/SDL_sysurl.m
+index 6c5783522..96b078230 100644
+--- a/src/misc/ios/SDL_sysurl.m
++++ b/src/misc/ios/SDL_sysurl.m
+@@ -29,8 +29,15 @@ SDL_SYS_OpenURL(const char *url)
+ 
+     NSString *nsstr = [NSString stringWithUTF8String:url];
+     NSURL *nsurl = [NSURL URLWithString:nsstr];
++    if (!nsurl) {
++        return -1;
++    }
++
++    if (@available(iOS 10.0, tvOS 10.0, *)) {
++        [[UIApplication sharedApplication] openURL:nsurl options:@{} completionHandler:nil];
++        return 0;
++    }
+     return [[UIApplication sharedApplication] openURL:nsurl] ? 0 : -1;
+ }}
+ 
+ /* vi: set ts=4 sw=4 expandtab: */
+-
+diff --git a/src/video/uikit/SDL_uikitappdelegate.h b/src/video/uikit/SDL_uikitappdelegate.h
+index ac0a88ac9..436fd50c3 100644
+--- a/src/video/uikit/SDL_uikitappdelegate.h
++++ b/src/video/uikit/SDL_uikitappdelegate.h
+@@ -29,6 +29,15 @@
+ 
+ @end
+ 
++API_AVAILABLE(ios(13.0), tvos(13.0))
++@interface SDLUIKitSceneDelegate : NSObject<UIApplicationDelegate, UIWindowSceneDelegate>
++
+++ (NSString *)getSceneDelegateClassName;
++
++- (void)hideLaunchScreen;
++
++@end
++
+ @interface SDLUIKitDelegate : NSObject<UIApplicationDelegate>
+ 
+ + (id)sharedAppDelegate;
+diff --git a/src/video/uikit/SDL_uikitappdelegate.m b/src/video/uikit/SDL_uikitappdelegate.m
+index fb42d2202..4cae825f5 100644
+--- a/src/video/uikit/SDL_uikitappdelegate.m
++++ b/src/video/uikit/SDL_uikitappdelegate.m
+@@ -64,9 +64,17 @@ int SDL_UIKitRunApp(int argc, char *argv[], SDL_main_func mainFunction)
+     }
+     forward_argv[i] = NULL;
+ 
+-    /* Give over control to run loop, SDLUIKitDelegate will handle most things from here */
++    /* Give over control to run loop, the UIKit delegate will handle most things from here */
+     @autoreleasepool {
+-        UIApplicationMain(argc, argv, nil, [SDLUIKitDelegate getAppDelegateClassName]);
++        NSString *delegateClassName = nil;
++
++        if (@available(iOS 13.0, tvOS 13.0, *)) {
++            delegateClassName = [SDLUIKitSceneDelegate getSceneDelegateClassName];
++        }
++        if (!delegateClassName) {
++            delegateClassName = [SDLUIKitDelegate getAppDelegateClassName];
++        }
++        UIApplicationMain(argc, argv, nil, delegateClassName);
+     }
+ 
+     /* free the memory we used to hold copies of argc and argv */
+@@ -344,6 +352,156 @@ SDL_LoadLaunchImageNamed(NSString *name, int screenh)
+ 
+ @end
+ 
++@implementation SDLUIKitSceneDelegate {
++    UIWindow *launchWindow;
++}
++
+++ (NSString *)getSceneDelegateClassName
++{
++    return @"SDLUIKitSceneDelegate";
++}
++
++- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions
++{
++    if (![scene isKindOfClass:[UIWindowScene class]]) {
++        return;
++    }
++
++    UIWindowScene *windowScene = (UIWindowScene *)scene;
++    windowScene.delegate = self;
++    NSBundle *bundle = [NSBundle mainBundle];
++
++#if SDL_IPHONE_LAUNCHSCREEN
++    UIViewController *vc = nil;
++    NSString *screenname = nil;
++
++#if !TARGET_OS_TV
++    screenname = [bundle objectForInfoDictionaryKey:@"UILaunchStoryboardName"];
++
++    if (screenname) {
++        @try {
++            UIStoryboard *storyboard = [UIStoryboard storyboardWithName:screenname bundle:bundle];
++            __auto_type storyboardVc = [storyboard instantiateInitialViewController];
++            vc = [[SDLLaunchStoryboardViewController alloc] initWithStoryboardViewController:storyboardVc];
++        }
++        @catch (NSException *exception) {
++        }
++    }
++#endif
++
++    if (vc == nil) {
++        vc = [[SDLLaunchScreenController alloc] initWithNibName:screenname bundle:bundle];
++    }
++
++    if (vc.view) {
++        launchWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
++        launchWindow.frame = windowScene.coordinateSpace.bounds;
++        launchWindow.windowLevel = UIWindowLevelNormal + 1.0;
++        launchWindow.hidden = NO;
++        launchWindow.rootViewController = vc;
++    }
++#endif
++
++    [[NSFileManager defaultManager] changeCurrentDirectoryPath:[bundle resourcePath]];
++
++    for (NSUserActivity *activity in connectionOptions.userActivities) {
++        if (activity.webpageURL) {
++            [self sendDropFileForURL:activity.webpageURL];
++        }
++    }
++    for (UIOpenURLContext *urlContext in connectionOptions.URLContexts) {
++        [self sendDropFileForURL:urlContext.URL];
++    }
++
++    SDL_AddHintCallback(SDL_HINT_IDLE_TIMER_DISABLED,
++                        SDL_IdleTimerDisabledChanged, NULL);
++
++    SDL_SetMainReady();
++    [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
++}
++
++- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts
++{
++    for (UIOpenURLContext *context in URLContexts) {
++        [self sendDropFileForURL:context.URL];
++    }
++}
++
++#if !TARGET_OS_TV
++- (UIInterfaceOrientationMask)supportedInterfaceOrientationsForWindowScene:(UIWindowScene *)windowScene API_AVAILABLE(ios(27.0))
++{
++    for (UIWindow *window in windowScene.windows) {
++        if (window.hidden || window.alpha == 0.0) {
++            continue;
++        }
++        if ([window.accessibilityIdentifier isEqualToString:@"touchHLE.gameControls"]) {
++            return [window.rootViewController supportedInterfaceOrientations];
++        }
++    }
++    for (UIWindow *window in windowScene.windows) {
++        if (window.hidden || window.alpha == 0.0) {
++            continue;
++        }
++        if ([window.rootViewController isKindOfClass:[SDL_uikitviewcontroller class]]) {
++            return [window.rootViewController supportedInterfaceOrientations];
++        }
++    }
++    return UIInterfaceOrientationMaskAll;
++}
++#endif
++
++- (void)sendDropFileForURL:(NSURL *)url
++{
++    NSURL *fileURL = url.filePathURL;
++    if (fileURL != nil) {
++        SDL_SendDropFile(NULL, fileURL.path.UTF8String);
++    } else {
++        SDL_SendDropFile(NULL, url.absoluteString.UTF8String);
++    }
++    SDL_SendDropComplete(NULL);
++}
++
++- (void)hideLaunchScreen
++{
++    UIWindow *window = launchWindow;
++
++    if (!window || window.hidden) {
++        return;
++    }
++
++    launchWindow = nil;
++
++    [UIView animateWithDuration:0.2 animations:^{
++        window.alpha = 0.0;
++    } completion:^(BOOL finished) {
++        window.hidden = YES;
++        UIKit_ForceUpdateHomeIndicator();
++    }];
++}
++
++- (void)postFinishLaunch
++{
++    [self performSelector:@selector(hideLaunchScreen) withObject:nil afterDelay:0.0];
++
++    SDL_iPhoneSetEventPump(SDL_TRUE);
++    exit_status = forward_main(forward_argc, forward_argv);
++    SDL_iPhoneSetEventPump(SDL_FALSE);
++
++    if (launchWindow) {
++        launchWindow.hidden = YES;
++        launchWindow = nil;
++    }
++}
++
++- (UISceneConfiguration *)application:(UIApplication *)application configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession options:(UISceneConnectionOptions *)options
++{
++    UISceneConfiguration *configuration = [[UISceneConfiguration alloc] initWithName:@"SDLSceneConfiguration" sessionRole:connectingSceneSession.role];
++    configuration.delegateClass = [SDLUIKitSceneDelegate class];
++    return configuration;
++}
++
++@end
++
+ @implementation SDLUIKitDelegate {
+     UIWindow *launchWindow;
+ }
+diff --git a/src/video/uikit/SDL_uikitopenglview.m b/src/video/uikit/SDL_uikitopenglview.m
+index 3e59f19bc..284b29179 100644
+--- a/src/video/uikit/SDL_uikitopenglview.m
++++ b/src/video/uikit/SDL_uikitopenglview.m
+@@ -278,6 +278,10 @@
+ 
+ - (void)swapBuffers
+ {
++    if ([EAGLContext currentContext] != context) {
++        [EAGLContext setCurrentContext:context];
++    }
++
+     if (msaaFramebuffer) {
+         const GLenum attachments[] = {GL_COLOR_ATTACHMENT0};
+ 
+@@ -310,6 +314,7 @@
+     /* viewRenderbuffer should always be bound here. Code that binds something
+      * else is responsible for rebinding viewRenderbuffer, to reduce duplicate
+      * state changes. */
++    glBindRenderbuffer(GL_RENDERBUFFER, viewRenderbuffer);
+     [context presentRenderbuffer:GL_RENDERBUFFER];
+ }
+ 
+diff --git a/src/video/uikit/SDL_uikitvideo.m b/src/video/uikit/SDL_uikitvideo.m
+index 64cff193b..d3570a838 100644
+--- a/src/video/uikit/SDL_uikitvideo.m
++++ b/src/video/uikit/SDL_uikitvideo.m
+@@ -208,6 +208,12 @@ UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
+      * is used on an iPad. */
+     if (data != nil && data.uiwindow != nil) {
+         frame = data.uiwindow.bounds;
++
++        if (@available(iOS 13.0, tvOS 13.0, *)) {
++            if (data.uiwindow.windowScene != nil) {
++                return frame;
++            }
++        }
+     }
+ 
+ #if !TARGET_OS_TV
+diff --git a/src/video/uikit/SDL_uikitwindow.m b/src/video/uikit/SDL_uikitwindow.m
+index d2a465ba6..1fd09fc5c 100644
+--- a/src/video/uikit/SDL_uikitwindow.m
++++ b/src/video/uikit/SDL_uikitwindow.m
+@@ -83,7 +83,6 @@
+ 
+ @end
+ 
+-
+ static int
+ SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bool created)
+ {
+@@ -158,6 +157,40 @@ SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bool created)
+     return 0;
+ }
+ 
++static UIWindowScene *
++UIKit_GetActiveWindowScene(void)
++{
++    if (@available(iOS 13.0, tvOS 13.0, *)) {
++        NSSet<UIScene *> *connectedScenes = [UIApplication sharedApplication].connectedScenes;
++
++        for (UIScene *scene in connectedScenes) {
++            if ([scene isKindOfClass:[UIWindowScene class]]) {
++                UIWindowScene *windowScene = (UIWindowScene *)scene;
++                if (windowScene.activationState == UISceneActivationStateForegroundActive) {
++                    return windowScene;
++                }
++            }
++        }
++
++        for (UIScene *scene in connectedScenes) {
++            if ([scene isKindOfClass:[UIWindowScene class]]) {
++                UIWindowScene *windowScene = (UIWindowScene *)scene;
++                if (windowScene.activationState == UISceneActivationStateForegroundInactive) {
++                    return windowScene;
++                }
++            }
++        }
++
++        for (UIScene *scene in connectedScenes) {
++            if ([scene isKindOfClass:[UIWindowScene class]]) {
++                return (UIWindowScene *)scene;
++            }
++        }
++    }
++
++    return nil;
++}
++
+ int
+ UIKit_CreateWindow(_THIS, SDL_Window *window)
+ {
+@@ -212,9 +245,20 @@ UIKit_CreateWindow(_THIS, SDL_Window *window)
+         }
+ #endif /* !TARGET_OS_TV */
+ 
+-        /* ignore the size user requested, and make a fullscreen window */
+-        /* !!! FIXME: can we have a smaller view? */
+-        UIWindow *uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
++        UIWindow *uiwindow = nil;
++        if (data.uiscreen == [UIScreen mainScreen]) {
++            if (@available(iOS 13.0, tvOS 13.0, *)) {
++                UIWindowScene *windowScene = UIKit_GetActiveWindowScene();
++                if (windowScene) {
++                    uiwindow = [[SDL_uikitwindow alloc] initWithWindowScene:windowScene];
++                }
++            }
++        }
++        if (!uiwindow) {
++            /* ignore the size user requested, and make a fullscreen window */
++            /* !!! FIXME: can we have a smaller view? */
++            uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
++        }
+ 
+         /* put the window on an external display if appropriate. */
+         if (data.uiscreen != [UIScreen mainScreen]) {
+@@ -243,6 +287,14 @@ UIKit_ShowWindow(_THIS, SDL_Window * window)
+ {
+     @autoreleasepool {
+         SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
++
++        if (@available(iOS 13.0, tvOS 13.0, *)) {
++            UIWindowScene *windowScene = data.uiwindow.windowScene;
++            if (windowScene) {
++                data.uiwindow.frame = windowScene.coordinateSpace.bounds;
++            }
++        }
++        data.uiwindow.windowLevel = UIWindowLevelNormal + 2.0;
+         [data.uiwindow makeKeyAndVisible];
+ 
+         /* Make this window the current mouse focus for touch input */
+-- 
+2.43.0
+

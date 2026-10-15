@@ -1,0 +1,49 @@
+/target
+/vendor/boost
+/touchHLE_sandbox
+/DCIM
+/touchHLE_apps/*.ipa
+/touchHLE_apps/*.app
+touchHLE_log.txt
+
+# Xcode (integration testing app)
+
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+
+# Android
+
+*.iml
+.gradle
+/local.properties
+.idea/
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+android/app/src/main/jniLibs
+android/app/build
+android/build
+
+# macOS
+
+.DS_Store
+
+# Default developer dump file
+
+DUMP.txt
+
+# Local debug junk
+*.log
+touchHLE_apps/
+target/
+*.ipa
+touchHLE_pvrtc_cache/
+
+# iOS build (platform/ios)
+/dist
+xcuserdata/
+*.xcuserstate

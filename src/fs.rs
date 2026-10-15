@@ -1,0 +1,2088 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+//! Virtual filesystem, or "guest filesystem".
+//!
+//! This lets us put files and directories where the guest app expects them to
+//! be, without constraining the layout of the host filesystem.
+//!
+//! Most of the filesystem is frozen at the point of creation and can't be
+//! modified. The exception is the writeable parts of the app's sandboxed home
+//! directory (`Documents` etc).
+//!
+//! All files in the guest filesystem must have a corresponding file in the host
+//! filesystem, or a corresponding file inside a `.ipa` file (ZIP archive) in
+//! the host filesystem. Accessing a file requires traversing the guest
+//! filesystem's directory structure to find out the host path, or ZIP file
+//! member. After that point, the underlying file is accessed directly; there is
+//! no virtualization of file I/O.
+//!
+//! Directories only need a corresponding directory in the host filesystem if
+//! they are writeable (i.e. if new files can be created in them).
+//!
+//! See also [crate::paths], which has paths for host files used by touchHLE.
+
+mod bundle;
+
+pub use bundle::BundleData;
+
+use crate::fs::bundle::{IpaFile, IpaFileRef};
+use crate::paths;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+/// The actual location of a file outside the virtual filesystem, e.g. a host
+/// file path.
+#[derive(Debug)]
+enum FileLocation {
+    /// Path for a normal file. Can be read or written.
+    Path(PathBuf),
+    /// Reference to a file inside a `.ipa` file (ZIP archive). Read only.
+    IpaFileRef(IpaFileRef),
+    /// Name of a resource file bundled with touchHLE. Read only.
+    ResourceFilePath(String),
+}
+
+#[derive(Debug)]
+pub enum FsError {
+    AccessDenied,
+    AlreadyExist,
+    DirectoryNotEmpty,
+    DoesNotExist,
+    InvalidParentDir,
+    NonexistentParentDir,
+    ReadonlyParentDir,
+}
+
+#[derive(Debug)]
+pub enum FsNodeType {
+    File,
+    Directory,
+}
+
+#[derive(Debug)]
+enum FsNode {
+    File {
+        location: FileLocation,
+        writeable: bool,
+    },
+    Directory {
+        children: HashMap<String, FsNode>,
+        writeable: Option<PathBuf>,
+    },
+}
+impl FsNode {
+    fn from_host_dir(host_path: &Path, writeable: bool) -> Self {
+        let mut children = HashMap::new();
+        for entry in std::fs::read_dir(host_path).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            let host_path = entry.path();
+            let name = entry.file_name().into_string().unwrap();
+            // There is no support for symlinks within the virtual filesystem,
+            // but symlinks aren't uncommon in app bundles, so we treat a
+            // symlink as if it were a copy of the file it points to.
+            let kind = if kind.is_symlink() {
+                std::fs::metadata(&host_path).unwrap().file_type()
+            } else {
+                kind
+            };
+            if kind.is_file() {
+                children.insert(
+                    name,
+                    FsNode::File {
+                        location: FileLocation::Path(host_path),
+                        writeable,
+                    },
+                );
+            } else if kind.is_dir() {
+                children.insert(name, FsNode::from_host_dir(&host_path, writeable));
+            } else {
+                log!("Warning: skipping non-regular filesystem entry {:?}", host_path);
+            }
+        }
+        FsNode::Directory {
+            children,
+            writeable: match writeable {
+                true => Some(host_path.to_owned()),
+                false => None,
+            },
+        }
+    }
+
+    // Convenience methods for constructing the read-only parts of the initial
+    // filesystem layout
+
+    fn dir() -> Self {
+        FsNode::Directory {
+            children: HashMap::new(),
+            writeable: None,
+        }
+    }
+    fn with_child(mut self, name: &str, child: FsNode) -> Self {
+        let FsNode::Directory {
+            ref mut children,
+            writeable: _,
+        } = self
+        else {
+            panic!();
+        };
+        assert!(children.insert(String::from(name), child).is_none());
+        self
+    }
+    fn bundle_zip_file(file_ref: IpaFileRef) -> Self {
+        FsNode::File {
+            location: FileLocation::IpaFileRef(file_ref),
+            writeable: false,
+        }
+    }
+    fn resource_file(name: String) -> Self {
+        FsNode::File {
+            location: FileLocation::ResourceFilePath(name),
+            writeable: false,
+        }
+    }
+
+    // ИСПРАВЛЕНИЕ: Рекурсивно обновляем пути хоста во всем дереве VFS
+    // при перемещении или переименовании директорий. Без этого дочерние
+    // файлы будут ссылаться на старые несуществующие пути.
+    fn update_host_paths_recursively(&mut self, new_host_path: PathBuf) {
+        match self {
+            FsNode::File {
+                location: FileLocation::Path(p),
+                ..
+            } => {
+                *p = new_host_path;
+            }
+            FsNode::Directory {
+                children,
+                writeable: Some(p),
+            } => {
+                *p = new_host_path.clone();
+                for (name, child) in children.iter_mut() {
+                    child.update_host_paths_recursively(new_host_path.join(name));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// Put well-known paths in the guest filesystem here.
+/// Path of the applications directory in the guest filesystem.
+pub const APPLICATIONS: &GuestPath = GuestPath::new_const("/var/mobile/Applications");
+
+/// Like [Path] but for the virtual filesystem.
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct GuestPath(str);
+impl GuestPath {
+    const fn new_const(s: &str) -> &GuestPath {
+        unsafe { &*(s as *const str as *const GuestPath) }
+    }
+
+    pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &GuestPath {
+        unsafe { &*(s.as_ref() as *const str as *const GuestPath) }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// Join a path component.
+    ///
+    /// This should use `AsRef<GuestPath>`, but we can't have a blanket
+    /// implementation of `AsRef<GuestPath>` for all `AsRef<str>` types, so we
+    /// would have to implement it for everything that can derference to `&str`.
+    /// It's easier to just use `&str`.
+    ///
+    /// Warning!
+    /// This function should only be used for internal touchHLE
+    /// purposes.
+    /// For Foundation case, use `[NSString stringByAppendingPathComponent:]`
+    pub fn join<P: AsRef<str>>(&self, path: P) -> GuestPathBuf {
+        GuestPathBuf::from(format!("{}/{}", self.as_str(), path.as_ref()))
+    }
+
+    /// Splits the path into a parent path and a file name.
+    pub fn parent_and_file_name(&self) -> Option<(&GuestPath, &str)> {
+        // Strip trailing slashes to handle paths like "/foo/bar/"
+        let path_str = self.as_str().trim_end_matches('/');
+        if path_str.is_empty() {
+            return None;
+        }
+        let (parent_name, file_name) = path_str.rsplit_once('/')?;
+        if file_name.is_empty() {
+            return None;
+        }
+        Some((GuestPath::new(parent_name), file_name))
+    }
+
+    /// Get the final component of the path.
+    pub fn file_name(&self) -> Option<&str> {
+        let (_, file_name) = self.parent_and_file_name()?;
+        Some(file_name)
+    }
+
+    /// Get the parent directory of the path.
+    pub fn parent(&self) -> Option<&GuestPath> {
+        let (parent_name, _) = self.parent_and_file_name()?;
+        Some(parent_name)
+    }
+}
+impl AsRef<GuestPath> for GuestPath {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+impl AsRef<str> for GuestPath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl AsRef<GuestPath> for str {
+    fn as_ref(&self) -> &GuestPath {
+        unsafe { &*(self as *const str as *const GuestPath) }
+    }
+}
+impl ToOwned for GuestPath {
+    type Owned = GuestPathBuf;
+    fn to_owned(&self) -> GuestPathBuf {
+        GuestPathBuf::from(self)
+    }
+}
+
+/// Like [PathBuf] but for the virtual filesystem.
+#[derive(Debug, Clone, Default)]
+pub struct GuestPathBuf(String);
+impl From<String> for GuestPathBuf {
+    fn from(string: String) -> GuestPathBuf {
+        GuestPathBuf(string)
+    }
+}
+impl From<&GuestPath> for GuestPathBuf {
+    fn from(guest_path: &GuestPath) -> GuestPathBuf {
+        guest_path.as_str().to_string().into()
+    }
+}
+impl From<GuestPathBuf> for String {
+    fn from(guest_path: GuestPathBuf) -> String {
+        guest_path.0
+    }
+}
+impl std::ops::Deref for GuestPathBuf {
+    type Target = GuestPath;
+    fn deref(&self) -> &GuestPath {
+        let s: &str = &self.0;
+        s.as_ref()
+    }
+}
+impl AsRef<GuestPath> for GuestPathBuf {
+    fn as_ref(&self) -> &GuestPath {
+        self
+    }
+}
+impl std::borrow::Borrow<GuestPath> for GuestPathBuf {
+    fn borrow(&self) -> &GuestPath {
+        self
+    }
+}
+
+fn apply_path_component<'a>(components: &mut Vec<&'a str>, component: &'a str) {
+    match component {
+        "" => (),
+        "." => (),
+        ".." => {
+            components.pop();
+        }
+        _ => components.push(component),
+    }
+}
+
+/// Resolve a path so that it is absolute and has no `.`, `..` or empty
+/// components.
+/// The result is a series of zero or more path components forming
+/// an absolute path (e.g. `["foo", "bar"]` means `/foo/bar`).
+///
+/// `relative_to` is the starting point for resolving a relative path, e.g. the
+/// current directory.
+/// It must be an absolute path. It is optional if `path`
+/// is absolute.
+pub fn resolve_path<'a>(path: &'a GuestPath, relative_to: Option<&'a GuestPath>) -> Vec<&'a str> {
+    log_dbg!("Resolving {:?} relative to {:?}", path, relative_to);
+    let mut components = Vec::new();
+
+    if !path.as_str().starts_with('/') {
+        let relative_to = relative_to.unwrap().as_str();
+        assert!(relative_to.starts_with('/'));
+        for component in relative_to.split('/') {
+            apply_path_component(&mut components, component);
+        }
+    }
+
+    for component in path.as_str().split('/') {
+        apply_path_component(&mut components, component);
+    }
+
+    // --- Path deduplication heuristic ---
+    // Some guest apps (Triniti engine, OMH!, etc.) construct invalid paths by
+    // concatenating the Documents (or other sandbox) directory twice, e.g.:
+    //   /var/mobile/.../Documents/ + /var/mobile/.../Documents/.AudioCache...
+    // This results in a path like:
+    //   /var/mobile/.../Documents/var/mobile/.../Documents/.AudioCache...
+    // which has a repeated prefix. Detect and strip the duplication so the
+    // filesystem lookup succeeds. We look for the *home directory prefix*
+    // appearing a second time within the resolved components.
+    //
+    // Strategy: if we find the sequence ["var", "mobile", "Applications"] at
+    // any position > 0, that second occurrence marks the start of the "real"
+    // path — truncate everything before it.
+    if components.len() > 6 {
+        let marker = ["var", "mobile", "Applications"];
+        // Skip the first occurrence (position 0) and look for a second one.
+        if let Some(dup_start) = components.windows(marker.len()).position(|w| w == marker) {
+            // Check if there's a second occurrence of the same marker.
+            if let Some(second_pos) = components[dup_start + 1..]
+                .windows(marker.len())
+                .position(|w| w == marker)
+            {
+                let real_start = dup_start + 1 + second_pos;
+                log_dbg!(
+                    "Path deduplication: stripping duplicate prefix at component {}",
+                    real_start
+                );
+                components = components[real_start..].to_vec();
+            }
+        }
+    }
+
+    log_dbg!("=> {:?}", components);
+
+    components
+}
+
+/// Like [std::fs::OpenOptions] but for the guest filesystem.
+#[derive(Debug)]
+pub struct GuestOpenOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+    /// `O_CREAT|O_EXCL` semantics: the file must not already exist.
+    create_new: bool,
+    truncate: bool,
+}
+impl GuestOpenOptions {
+    pub fn new() -> GuestOpenOptions {
+        GuestOpenOptions {
+            read: false,
+            write: false,
+            append: false,
+            create: false,
+            create_new: false,
+            truncate: false,
+        }
+    }
+    pub fn read(&mut self) -> &mut Self {
+        self.read = true;
+        self
+    }
+    pub fn write(&mut self) -> &mut Self {
+        self.write = true;
+        self
+    }
+    pub fn append(&mut self) -> &mut Self {
+        self.append = true;
+        self
+    }
+    pub fn create(&mut self) -> &mut Self {
+        self.create = true;
+        self
+    }
+    /// Open only if the file does not already exist (`O_CREAT|O_EXCL`).
+    pub fn create_new(&mut self) -> &mut Self {
+        self.create_new = true;
+        self
+    }
+    pub fn truncate(&mut self) -> &mut Self {
+        self.truncate = true;
+        self
+    }
+}
+
+/// Handles host I/O errors by panicking. This is intended specifically for
+/// opening files.
+/// The assumption is that the guest filesystem contains all the
+/// information needed to tell if opening a file should succeed, so if opening
+/// the file nonetheless fails, there's either a bug or the user has done
+/// something wrong.
+fn handle_open_err<T, E: std::fmt::Display, P: std::fmt::Debug>(
+    open_result: Result<T, E>,
+    host_path: P,
+) -> T {
+    match open_result {
+        Ok(ok) => ok,
+        Err(e) => panic!("Unexpected I/O failure when trying to access real path {host_path:?}: {e}. This might indicate that files needed by touchHLE are missing, or were moved while it was running."),
+    }
+}
+
+/// Backing for the guest's `/dev/random` and `/dev/urandom` character devices.
+///
+/// On Apple platforms (iOS/macOS) both device nodes are identical: a
+/// non-blocking kernel CSPRNG that draws from a single entropy pool and never
+/// returns an error or a short read (see the `random(4)` manual page). We
+/// mirror that behaviour by pulling bytes from the host operating system's own
+/// `/dev/urandom` when it exists (Android, Linux and macOS — touchHLE's primary
+/// targets), falling back to a seeded xorshift64* generator on hosts that lack
+/// the device (e.g. Windows) so a read can never fail.
+#[derive(Debug)]
+pub struct RandomFile {
+    /// Host `/dev/urandom` handle, when available, for genuine OS entropy.
+    host_source: Option<File>,
+    /// State for the portable fallback generator. Never zero.
+    prng_state: u64,
+}
+
+impl RandomFile {
+    fn new() -> RandomFile {
+        // Seed the fallback generator from several host entropy sources so it
+        // is still well-varied on platforms without a host random device.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15; // fractional bits of phi
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(UNIX_EPOCH) {
+            seed ^= dur.as_nanos() as u64;
+        }
+        // Mix in an address that varies with ASLR each run.
+        let local = 0u8;
+        seed ^= (&local as *const u8) as u64;
+        RandomFile {
+            host_source: File::open("/dev/urandom").ok(),
+            prng_state: seed | 1,
+        }
+    }
+
+    /// xorshift64* — a fast, well-distributed non-cryptographic generator used
+    /// only as a fallback when the host has no random device.
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.prng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.prng_state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn fill_from_prng(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let bytes = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+
+    /// Fill `buf` completely with random bytes, matching the Apple semantics of
+    /// never returning a short read.
+    fn fill(&mut self, buf: &mut [u8]) -> usize {
+        if let Some(file) = self.host_source.as_mut() {
+            match file.read(buf) {
+                Ok(n) if n == buf.len() => return n,
+                Ok(n) => {
+                    // The host `/dev/urandom` should never short-read, but be
+                    // defensive and top up the remainder from the fallback.
+                    self.fill_from_prng(&mut buf[n..]);
+                    return buf.len();
+                }
+                Err(_) => {
+                    // Stop using the broken handle and fall back below.
+                    self.host_source = None;
+                }
+            }
+        }
+        self.fill_from_prng(buf);
+        buf.len()
+    }
+}
+
+/// Like [File] but for the guest filesystem.
+#[derive(Debug)]
+pub(crate) struct PipeBuffer {
+    bytes: VecDeque<u8>,
+    read_handles: usize,
+    write_handles: usize,
+}
+
+impl PipeBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            read_handles: 1,
+            write_handles: 1,
+        }
+    }
+
+    /// Есть ли непрочитанные байты (для poll(2): POLLIN на читающем конце).
+    pub(crate) fn poll_has_data(&self) -> bool {
+        !self.bytes.is_empty()
+    }
+
+    /// Открыт ли хоть один читающий конец (для poll(2): POLLOUT/POLLERR
+    /// на пишущем конце).
+    pub(crate) fn poll_has_readers(&self) -> bool {
+        self.read_handles > 0
+    }
+
+    /// Открыт ли хоть один пишущий конец (для poll(2): POLLHUP на читающем
+    /// конце — writer закрыт, данные кончились).
+    pub(crate) fn poll_has_writers(&self) -> bool {
+        self.write_handles > 0
+    }
+}
+
+#[derive(Debug)]
+pub enum GuestFile {
+    Directory,
+    File(File),
+    IpaBundleFile(IpaFile),
+    ResourceFile(paths::ResourceFile),
+    /// Placeholder for a socket descriptor.
+    ///
+    /// A socket has no data of its own here: the real host socket lives in
+    /// `libc::sys::socket`'s state, keyed by the descriptor number. Guest
+    /// `read(2)`/`write(2)` on a socket are therefore dispatched to
+    /// `libc::sys::socket::{read_socket, write_socket}` *before* reaching this
+    /// type (see `libc::posix_io::{read, write}`), so the "not supported on
+    /// socket via GuestFile" errors below are only a safety net for a host-side
+    /// path that forgot the dispatch — they should never be visible to an app.
+    Socket,
+    PipeRead(std::rc::Rc<std::cell::RefCell<PipeBuffer>>),
+    PipeWrite(std::rc::Rc<std::cell::RefCell<PipeBuffer>>),
+    /// A `/dev/random` or `/dev/urandom` character device.
+    Random(RandomFile),
+}
+
+impl GuestFile {
+    fn from_host_file(file: File) -> GuestFile {
+        GuestFile::File(file)
+    }
+
+    fn from_ipa_file(file: &IpaFileRef) -> GuestFile {
+        GuestFile::IpaBundleFile(file.open())
+    }
+
+    fn from_resource_file(file: paths::ResourceFile) -> GuestFile {
+        GuestFile::ResourceFile(file)
+    }
+
+    fn from_directory() -> GuestFile {
+        GuestFile::Directory
+    }
+
+    /// Construct a `/dev/random` / `/dev/urandom` character device.
+    pub fn random() -> GuestFile {
+        GuestFile::Random(RandomFile::new())
+    }
+
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        match self {
+            GuestFile::File(file) => file.sync_all(),
+            GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
+            GuestFile::Directory => {
+                log!("Warning: syncing directory as a guest file.");
+                Ok(())
+            }
+            // Syncing a character device is a no-op.
+            GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Sync operation not supported on socket",
+            )),
+        }
+    }
+    pub fn set_len(&self, len: u64) -> std::io::Result<()> {
+        match self {
+            GuestFile::File(file) => file.set_len(len),
+            GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Attempt to resize a read-only file",
+            )),
+            GuestFile::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "Attempt to resize a directory as a guest file",
+            )),
+            GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Attempt to resize a character device or pipe",
+                ))
+            }
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "set_len not supported on socket",
+            )),
+        }
+    }
+
+    pub fn stream_len(&mut self) -> std::io::Result<u64> {
+        // TODO: Remove if standard stream_len ever gets stabilized.
+        let old_position = self.stream_position()?;
+        let len = self.seek(std::io::SeekFrom::End(0))?;
+        self.seek(std::io::SeekFrom::Start(old_position))?;
+        Ok(len)
+    }
+
+    pub fn is_seekable(&self) -> bool {
+        // Due to legacy directory iteration support, directories are seekable
+        // https://stackoverflow.com/questions/65911066/what-does-lseek-mean-for-a-directory-file-descriptor
+        // Random character devices are not meaningfully seekable.
+        !matches!(
+            self,
+            GuestFile::Socket
+                | GuestFile::Random(_)
+                | GuestFile::PipeRead(_)
+                | GuestFile::PipeWrite(_)
+        )
+    }
+
+    /// Duplicate this file descriptor, creating an independent handle that
+    /// shares the underlying kernel file description (for `GuestFile::File`)
+    /// or creates a new cursor at the same position (for IPA/resource files).
+    /// This is used to implement POSIX `dup(2)` / `fcntl(F_DUPFD)`.
+    pub fn try_clone(&self) -> std::io::Result<GuestFile> {
+        match self {
+            GuestFile::File(file) => {
+                let cloned = file.try_clone()?;
+                Ok(GuestFile::File(cloned))
+            }
+            GuestFile::IpaBundleFile(ipa_file) => {
+                // IpaFile uses Cursor<Rc<[u8]>> — clone shares the data and
+                // copies the seek position.
+                Ok(GuestFile::IpaBundleFile(ipa_file.clone()))
+            }
+            GuestFile::ResourceFile(_) => {
+                // ResourceFile wraps a host File. We cannot easily clone it
+                // without re-opening, so return an error. This is rare.
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Cannot duplicate a resource file descriptor",
+                ))
+            }
+            GuestFile::Directory => Ok(GuestFile::Directory),
+            // A fresh, independent random source is an acceptable duplicate:
+            // both handles yield unrelated random bytes, just like the kernel
+            // device.
+            GuestFile::Random(_) => Ok(GuestFile::random()),
+            GuestFile::PipeRead(pipe) => {
+                pipe.borrow_mut().read_handles += 1;
+                Ok(GuestFile::PipeRead(pipe.clone()))
+            }
+            GuestFile::PipeWrite(pipe) => {
+                pipe.borrow_mut().write_handles += 1;
+                Ok(GuestFile::PipeWrite(pipe.clone()))
+            }
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Cannot duplicate a socket file descriptor",
+            )),
+        }
+    }
+
+    pub fn close_pipe_endpoint(&mut self) {
+        let (pipe, reading) = match self {
+            GuestFile::PipeRead(pipe) => (Some(pipe.clone()), true),
+            GuestFile::PipeWrite(pipe) => (Some(pipe.clone()), false),
+            _ => (None, false),
+        };
+        if let Some(pipe) = pipe {
+            let mut pipe = pipe.borrow_mut();
+            if reading {
+                pipe.read_handles = pipe.read_handles.saturating_sub(1);
+            } else {
+                pipe.write_handles = pipe.write_handles.saturating_sub(1);
+            }
+        }
+    }
+}
+
+impl Read for GuestFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            GuestFile::File(file) => file.read(buf),
+            GuestFile::IpaBundleFile(file) => file.read(buf),
+            GuestFile::ResourceFile(file) => file.get().read(buf),
+            GuestFile::Random(random) => Ok(random.fill(buf)),
+            GuestFile::PipeRead(pipe) => {
+                let mut pipe = pipe.borrow_mut();
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if pipe.bytes.is_empty() {
+                    if pipe.write_handles == 0 {
+                        return Ok(0);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "pipe has no data yet",
+                    ));
+                }
+                let count = buf.len().min(pipe.bytes.len());
+                for slot in &mut buf[..count] {
+                    *slot = pipe.bytes.pop_front().unwrap();
+                }
+                Ok(count)
+            }
+            GuestFile::PipeWrite(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "attempt to read from the write end of a pipe",
+            )),
+            GuestFile::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "Attempt to read from a directory as a guest file",
+            )),
+            // Sockets are dispatched to `libc::sys::socket::read_socket` by
+            // `libc::posix_io::read()`; reaching this arm means a host-side
+            // caller read the placeholder file object directly.
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "read on a socket must go through libc::sys::socket::read_socket",
+            )),
+        }
+    }
+}
+
+impl Write for GuestFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            GuestFile::File(file) => file.write(buf),
+            GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Attempt to write to a read-only file",
+            )),
+            // Writing to the random device is permitted on Apple platforms
+            // (it stirs the entropy pool). We accept and discard the bytes so
+            // apps that write a seed never fail.
+            GuestFile::Random(_) => Ok(buf.len()),
+            GuestFile::PipeRead(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "attempt to write to the read end of a pipe",
+            )),
+            GuestFile::PipeWrite(pipe) => {
+                let mut pipe = pipe.borrow_mut();
+                if pipe.read_handles == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "pipe has no readers",
+                    ));
+                }
+                pipe.bytes.extend(buf);
+                Ok(buf.len())
+            }
+            GuestFile::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "Attempt to write to a directory as a guest file",
+            )),
+            // See the note on the `read` arm: guest writes are dispatched to
+            // `libc::sys::socket::write_socket` by `libc::posix_io::write()`.
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "write on a socket must go through libc::sys::socket::write_socket",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            GuestFile::File(file) => file.flush(),
+            GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Attempt to flush a read-only file",
+            )),
+            GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
+            GuestFile::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "Attempt to flush a directory as a guest file",
+            )),
+            // Flushing a socket has nothing to flush: the host socket is
+            // unbuffered, so report success (and `posix_io::fflush()` already
+            // short-circuits on socket descriptors).
+            GuestFile::Socket => Ok(()),
+        }
+    }
+}
+
+impl Seek for GuestFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            GuestFile::File(file) => file.seek(pos),
+            GuestFile::IpaBundleFile(file) => file.seek(pos),
+            GuestFile::ResourceFile(file) => file.get().seek(pos),
+            GuestFile::Directory => {
+                // Note: directories as supposed to be seekable on iOS!
+                // https://stackoverflow.com/questions/65911066/what-does-lseek-mean-for-a-directory-file-descriptor
+                // As far as I can (f)tell, apps are really not using that
+                // properly and returning -1 on fseek/ftell is fine.
+                // TODO: implement seeking properly and return "cookie" values
+                log!("Warning: Seeking a directory as a guest file!");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    "Attempt to seek a directory as a guest file",
+                ))
+            }
+            // Seeking a character device is a no-op: the offset is
+            // meaningless, so report position 0 rather than failing.
+            GuestFile::Random(_) => Ok(0),
+            GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "attempt to seek a pipe",
+            )),
+            // A socket has no file offset (`lseek(2)` fails with ESPIPE, which
+            // `libc::posix_io::lseek()` reports before getting here).
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "seek not supported on socket (ESPIPE)",
+            )),
+        }
+    }
+}
+
+/// The type that owns the guest filesystem and provides accessors for it.
+#[derive(Debug)]
+pub struct Fs {
+    root: FsNode,
+    working_directory: GuestPathBuf,
+    home_directory: GuestPathBuf,
+    /// Host directory used as a copy-on-write shadow for IPA bundle files.
+    /// When a guest app writes to a read-only IPA bundle file, the file is
+    /// first extracted here and the VFS node is upgraded to a writable Path.
+    cow_dir: Option<PathBuf>,
+}
+impl Fs {
+    /// Construct a filesystem containing a home directory for the app, its
+    /// bundle and documents, and the bundled shared libraries.
+    /// Returns the new
+    /// filesystem and the guest path of the bundle.
+    ///
+    /// The `bundle_dir_name` argument will be used as the name of the bundle
+    /// directory in the guest filesystem, and must end in `.app`.
+    /// This allows the host directory for the bundle to be renamed from its
+    /// original name without confusing the app.
+    /// Supposedly Apple does something
+    /// similar when executing iOS apps on modern Macs.
+    ///
+    /// The `bundle_id` argument should be some value that uniquely identifies
+    /// the app.
+    /// This will be used to construct the host path for the app's
+    /// sandbox directory, where documents can be stored.
+    /// A directory will be
+    /// created at that path if it does not already exist.
+    ///
+    /// `read_only_mode` can be used when the app won't actually be run, just
+    /// just inspected (e.g. to retrieve display name and icon), so no user data
+    /// directories are required and no sandbox directory will be created on the
+    /// host.
+    pub fn new(
+        app_bundle: BundleData,
+        bundle_dir_name: String,
+        bundle_id: &str,
+        read_only_mode: bool,
+    ) -> (Fs, GuestPathBuf) {
+        const FAKE_UUID: &str = "00000000-0000-0000-0000-000000000000";
+        let home_directory = APPLICATIONS.join(FAKE_UUID);
+        let bundle_guest_path = home_directory.join(&bundle_dir_name);
+        let working_directory = bundle_guest_path.clone();
+
+        let directories = ["Documents", "Library", "tmp"];
+        let host_path_directories = directories.map(|dir| {
+            if !read_only_mode {
+                let path = paths::user_data_base_path()
+                    .join(paths::SANDBOX_DIR)
+                    .join(bundle_id)
+                    .join(dir);
+
+                if dir == "tmp" {
+                    // We clean temporary directory for current app at startup.
+                    // This is no-op if directory doesn't exist.
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log_dbg!(
+                                "Unable to clean tmp host folder {:?} at startup: {}",
+                                path,
+                                e
+                            );
+                        }
+                    }
+                }
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    panic!("Could not create documents directory for app at {path:?}: {e:?}");
+                }
+                Some(path)
+            } else {
+                None
+            }
+        });
+        if !read_only_mode {
+            // Special case: Some apps may create save files at
+            // Library/Preferences at the start, thus presence of that
+            // directory is expected
+            let path = paths::user_data_base_path()
+                .join(paths::SANDBOX_DIR)
+                .join(bundle_id)
+                .join("Library")
+                .join("Preferences");
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                panic!("Could not create documents sub-directory for app at {path:?}: {e:?}");
+            }
+        }
+
+        // Some Free Software libraries are bundled with touchHLE.
+        use paths::DYLIBS_DIR;
+        let usr_lib = FsNode::dir()
+            .with_child(
+                "libgcc_s.1.dylib",
+                FsNode::resource_file(format!("{}/libgcc_s.1.dylib", DYLIBS_DIR)),
+            )
+            .with_child(
+                "libstdc++.6.dylib",
+                FsNode::resource_file(format!("{}/libstdc++.6.0.9.dylib", DYLIBS_DIR)),
+            )
+            .with_child(
+                "libstdc++.6.0.9.dylib",
+                FsNode::resource_file(format!("{}/libstdc++.6.0.9.dylib", DYLIBS_DIR)),
+            )
+            .with_child(
+                "libc++.1.dylib",
+                FsNode::resource_file(format!("{}/libc++.1.dylib", DYLIBS_DIR)),
+            )
+            .with_child(
+                "libz.1.2.3.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libz.1.2.3.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libz.1.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libz.1.2.3.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libz.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libz.1.2.3.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libz.1.1.3.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libz.1.2.3.dylib")),
+            )
+            .with_child(
+                "libiconv.2.dylib",
+                FsNode::resource_file(format!("{}/libiconv.2.dylib", DYLIBS_DIR)),
+            )
+            .with_child(
+                "libc++abi.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libc++abi.dylib")),
+            )
+            .with_child(
+                "libsqlite3.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libsqlite3.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libsqlite3.0.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libsqlite3.dylib")),
+            );
+
+        let mut app_dir_children = HashMap::new();
+        app_dir_children.insert(bundle_dir_name, app_bundle.into_fs_node());
+        for (dir, host_path) in directories.iter().zip(host_path_directories.iter()) {
+            if let Some(host_path) = host_path {
+                app_dir_children.insert(
+                    dir.to_string(),
+                    FsNode::from_host_dir(host_path, /* writeable: */ true),
+                );
+            }
+        }
+
+        let library_node = match &host_path_directories[1] {
+            Some(host_path) => FsNode::from_host_dir(host_path, true),
+            None => FsNode::dir(),
+        };
+
+        // Создаем физическую папку для корня ФС (чтобы shm_open мог создавать
+        // файлы вроде /mono.1)
+        let root_host_path = paths::user_data_base_path()
+            .join(paths::SANDBOX_DIR)
+            .join(bundle_id)
+            .join("root");
+
+        if !read_only_mode {
+            // Очищаем временные файлы корня при каждом запуске (аналогично tmp)
+            let _ = std::fs::remove_dir_all(&root_host_path);
+            if let Err(e) = std::fs::create_dir_all(&root_host_path) {
+                panic!("Could not create root directory for app at {root_host_path:?}: {e:?}");
+            }
+        }
+
+        // Если режим не read_only, монтируем физическую папку как корень с
+        // правами на запись
+        let root_node = if read_only_mode {
+            FsNode::dir()
+        } else {
+            FsNode::from_host_dir(&root_host_path, true)
+        };
+
+        // Create a writable host directory for the app's sandbox root
+        // (the UUID directory). Some apps (notably Unity/Mono games) need to
+        // create hidden directories like .wapi in this location.
+        let app_sandbox_host_path = if !read_only_mode {
+            let path = paths::user_data_base_path()
+                .join(paths::SANDBOX_DIR)
+                .join(bundle_id)
+                .join("AppSandbox");
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                panic!("Could not create app sandbox directory at {path:?}: {e:?}");
+            }
+            Some(path)
+        } else {
+            None
+        };
+
+        let root = root_node
+            .with_child(
+                "var",
+                FsNode::dir().with_child(
+                    "mobile",
+                    FsNode::dir()
+                        .with_child(
+                            "Applications",
+                            FsNode::dir().with_child(
+                                FAKE_UUID,
+                                FsNode::Directory {
+                                    children: app_dir_children,
+                                    writeable: app_sandbox_host_path,
+                                },
+                            ),
+                        )
+                        .with_child("Library", library_node),
+                ),
+            )
+            .with_child("usr", FsNode::dir().with_child("lib", usr_lib));
+        log_dbg!("Initial filesystem layout: {:#?}", root);
+
+        // Prepare the copy-on-write shadow directory for IPA bundle files.
+        // It lives alongside the app's sandbox so CoW'd files persist across
+        // runs (matching the behaviour real iOS would show after the app
+        // modifies its own bundle, which is impossible on a real device but
+        // some games assume it works).
+        let cow_dir = if !read_only_mode {
+            let path = paths::user_data_base_path()
+                .join(paths::SANDBOX_DIR)
+                .join(bundle_id)
+                .join("bundle_cow");
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                log!(
+                    "Warning: Could not create CoW directory at {:?}: {}",
+                    path,
+                    e
+                );
+                None
+            } else {
+                Some(path)
+            }
+        } else {
+            None
+        };
+
+        let fs = Fs {
+            root,
+            working_directory,
+            home_directory,
+            cow_dir,
+        };
+        assert!(fs.lookup_node(&bundle_guest_path).is_some());
+        (fs, bundle_guest_path)
+    }
+
+    /// Create a fake filesystem (see [crate::Environment::new_without_app]).
+    pub fn new_fake_fs() -> Fs {
+        Fs {
+            root: FsNode::dir(),
+            working_directory: GuestPathBuf::from(String::new()),
+            home_directory: GuestPathBuf::from(String::new()),
+            cow_dir: None,
+        }
+    }
+
+    /// Get the absolute path of the guest app's (sandboxed) home directory.
+    pub fn home_directory(&self) -> &GuestPath {
+        &self.home_directory
+    }
+
+    /// Get the absolute path of the current working directory.
+    /// The resulting
+    /// path may be invalid if the directory was moved or deleted.
+    pub fn working_directory(&self) -> &GuestPath {
+        &self.working_directory
+    }
+
+    /// Attempts to change the working directory.
+    pub fn change_working_directory(&mut self, new_path: &GuestPath) -> Result<&GuestPath, ()> {
+        // The app volume is case-insensitive.  Resolve to the VFS spelling
+        // before saving the new CWD so later relative opens use the same path
+        // as stat/access and Foundation file-existence probes.
+        let resolved = self.resolve_case_insensitive_path(new_path).ok_or(())?;
+        if !self.is_dir(&resolved) {
+            return Err(());
+        }
+        self.working_directory = resolved;
+        Ok(&self.working_directory)
+    }
+
+    /// [Self::lookup_node] with a pre-resolved path.
+    fn lookup_node_inner(&self, resolved_path_components: &[&str]) -> Option<&FsNode> {
+        let mut node = &self.root;
+        for component in resolved_path_components {
+            let FsNode::Directory {
+                children,
+                writeable: _,
+            } = node
+            else {
+                return None;
+            };
+            node = children.get(*component)?
+        }
+        Some(node)
+    }
+
+    /// Get the node at a given path, if it exists.
+    fn lookup_node(&self, path: &GuestPath) -> Option<&FsNode> {
+        self.lookup_node_inner(&resolve_path(path, Some(&self.working_directory)))
+    }
+
+    /// Get the parent of the node at a given path, if it exists, and return it
+    /// together with the final path component.
+    /// This is an alternative to
+    /// [Self::lookup_node] useful when writing to a file, where it might not
+    /// exist yet (but its parent directory does).
+    fn lookup_parent_node(&mut self, path: &GuestPath) -> Option<(&mut FsNode, String)> {
+        let components = resolve_path(path, Some(&self.working_directory));
+        let (&final_component, parent_components) = components.split_last()?;
+
+        let mut parent = &mut self.root;
+        for &component in parent_components {
+            let FsNode::Directory {
+                children,
+                writeable: _,
+            } = parent
+            else {
+                return None;
+            };
+            parent = children.get_mut(component)?
+        }
+
+        Some((parent, final_component.to_string()))
+    }
+
+    /// Like [Path::exists] but for the guest filesystem.
+    pub fn exists(&self, path: &GuestPath) -> bool {
+        self.lookup_node(path).is_some()
+    }
+
+    /// Resolve an existing guest path using the case-insensitive semantics of
+    /// the iPhone OS application volume.
+    ///
+    /// App bundles are normally deployed on case-insensitive HFS/APFS volumes,
+    /// whereas the virtual filesystem uses `HashMap` keys and would otherwise
+    /// make every caller reproduce a directory scan.  The returned path is
+    /// absolute, normalized, and uses the spelling stored in the VFS.  `None`
+    /// means that no matching entry exists; this method never manufactures a
+    /// path for a file that is not mounted.
+    pub fn resolve_case_insensitive_path(&self, path: &GuestPath) -> Option<GuestPathBuf> {
+        let components = resolve_path(path, Some(&self.working_directory));
+        let mut resolved_path = String::from("/");
+
+        for component in components {
+            let component_lower = component.to_lowercase();
+            // `enumerate` borrows the VFS, so copy the matching spelling before
+            // extending `resolved_path` for the next component.
+            let matching_component = {
+                let mut entries = self.enumerate(GuestPath::new(&resolved_path)).ok()?;
+                entries
+                    .find(|entry| entry.to_lowercase() == component_lower)
+                    .map(str::to_owned)?
+            };
+            if resolved_path != "/" {
+                resolved_path.push('/');
+            }
+            resolved_path.push_str(&matching_component);
+        }
+
+        Some(GuestPathBuf::from(resolved_path))
+    }
+
+    /// Lenient fallback for [resolve_case_insensitive_path]: search for the
+    /// requested basename anywhere under the deepest existing ancestor
+    /// directory of `path` (bounded scan).
+    ///
+    /// iPhone-era games and middleware frequently hardcode asset paths that
+    /// only match the Xcode-flattened layout on the original device; some
+    /// bundles keep the same assets in subdirectories instead. The strict
+    /// case-insensitive walk above misses those, so as a last resort the
+    /// final path component is looked up by name in the subtree rooted at
+    /// the longest existing prefix of the request. Only used by callers
+    /// that would otherwise fail (e.g. audio decoding), never to reject a
+    /// path that resolves normally.
+    pub fn resolve_lenient_path(&self, path: &GuestPath) -> Option<GuestPathBuf> {
+        if let Some(p) = self.resolve_case_insensitive_path(path) {
+            return Some(p);
+        }
+        let components = resolve_path(path, Some(&self.working_directory));
+        let wanted = components.last()?.to_lowercase();
+        // Longest existing directory prefix of the request.
+        let mut prefix = String::from("/");
+        let mut prefix_len = 0usize;
+        for (i, comp) in components.iter().enumerate() {
+            let mut candidate = prefix.clone();
+            if candidate != "/" {
+                candidate.push('/');
+            }
+            candidate.push_str(comp);
+            if self.is_dir(GuestPath::new(&candidate)) {
+                prefix = candidate;
+                prefix_len = i + 1;
+            } else {
+                break;
+            }
+        }
+        if prefix_len + 1 >= components.len() {
+            // The parent directory exists and the name is simply absent
+            // from it; scanning the subtree cannot find anything new.
+            return None;
+        }
+        let mut stack: Vec<String> = vec![prefix];
+        let mut visited_dirs = 0usize;
+        while let Some(dir) = stack.pop() {
+            if visited_dirs >= 1000 {
+                return None;
+            }
+            visited_dirs += 1;
+            let Ok(entries) = self.enumerate_with_types(GuestPath::new(&dir)) else {
+                continue;
+            };
+            // Collect first so the borrow of self ends each iteration.
+            let entries: Vec<(String, bool)> = entries
+                .map(|(name, ty)| (name.to_owned(), matches!(ty, FsNodeType::Directory)))
+                .collect();
+            for (name, is_dir) in entries {
+                let full = format!("{}/{}", dir, name);
+                if is_dir {
+                    stack.push(full);
+                } else if name.to_lowercase() == wanted {
+                    return Some(GuestPathBuf::from(full));
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns access information about the file/directory at the path
+    /// (exists, read, write, execute)
+    pub fn access(&self, path: &GuestPath) -> (bool, bool, bool, bool) {
+        match self.lookup_node(path) {
+            None => (false, false, false, false),
+            Some(node) => match node {
+                FsNode::File {
+                    location: _,
+                    writeable,
+                } => (true, true, *writeable, false),
+                FsNode::Directory {
+                    children: _,
+                    writeable,
+                } => (true, true, writeable.is_some(), true),
+            },
+        }
+    }
+
+    /// Like [Path::is_file] but for the guest filesystem.
+    pub fn is_file(&self, path: &GuestPath) -> bool {
+        matches!(self.lookup_node(path), Some(FsNode::File { .. }))
+    }
+
+    /// Like [Path::is_dir] but for the guest dirsystem.
+    pub fn is_dir(&self, path: &GuestPath) -> bool {
+        matches!(self.lookup_node(path), Some(FsNode::Directory { .. }))
+    }
+
+    pub fn modified(&self, path: &GuestPath) -> Result<i64, ()> {
+        // TODO: error handling
+        let node = self.lookup_node(path).ok_or(())?;
+        match node {
+            FsNode::File { location, .. } => match location {
+                // Note: the returned time is consistent with 'Date' and 'Time'
+                // of files inside IPA archive as reported by 7-zip.
+                // But it can be few hours off in comparison with modification
+                // time reported by NSFileModificationDate for app bundle files
+                // and changes if system timezone changes and apps gets
+                // re-installed!
+                // This shouldn't be a big problem as we're always assuming
+                // GMT in the codebase right now.
+                // TODO: double check that when we support different timezones
+                FileLocation::IpaFileRef(ipa_file_ref) => {
+                    Ok(ipa_file_ref.get_last_modified().into())
+                }
+                FileLocation::Path(path) => {
+                    // TODO: account for the current timezone, here it's in GMT
+                    fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .map(|t| {
+                            t.duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                                .try_into()
+                                .unwrap()
+                        })
+                        .map_err(|_| ())
+                }
+                FileLocation::ResourceFilePath(_) => Ok(0),
+            },
+            FsNode::Directory { writeable, .. } => {
+                if let Some(host_path) = writeable {
+                    fs::metadata(host_path)
+                        .and_then(|m| m.modified())
+                        .map(|t| {
+                            t.duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                                .try_into()
+                                .unwrap()
+                        })
+                        .map_err(|_| ())
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    pub fn size(&self, path: &GuestPath) -> Result<u64, ()> {
+        // TODO: error handling
+        let node = self.lookup_node(path).ok_or(())?;
+        match node {
+            FsNode::File { location, .. } => match location {
+                FileLocation::IpaFileRef(ipa_file_ref) => Ok(ipa_file_ref.get_size()),
+                FileLocation::Path(path) => {
+                    fs::metadata(path).map(|meta| meta.len()).map_err(|_| ())
+                }
+                FileLocation::ResourceFilePath(_) => Ok(0),
+            },
+            FsNode::Directory { writeable, .. } => {
+                if let Some(host_path) = writeable {
+                    fs::metadata(host_path)
+                        .map(|meta| meta.len())
+                        .map_err(|_| ())
+                } else {
+                    Ok(4096)
+                }
+            }
+        }
+    }
+
+    /// Get an iterator over the names of files/directories in a directory.
+    pub fn enumerate<P: AsRef<GuestPath>>(
+        &self,
+        path: P,
+    ) -> Result<impl Iterator<Item = &str>, ()> {
+        let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
+            return Err(());
+        };
+        Ok(children.keys().map(|name| name.as_str()))
+    }
+
+    /// Similar to [Fs::enumerate], but also returns fs node type.
+    pub fn enumerate_with_types<P: AsRef<GuestPath>>(
+        &self,
+        path: P,
+    ) -> Result<impl Iterator<Item = (&str, FsNodeType)>, ()> {
+        let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
+            return Err(());
+        };
+        Ok(children.iter().map(|(name, node)| {
+            (
+                name.as_str(),
+                match node {
+                    FsNode::File { .. } => FsNodeType::File,
+                    FsNode::Directory { .. } => FsNodeType::Directory,
+                },
+            )
+        }))
+    }
+
+    /// Recursively list the paths of files/directories in a directory.
+    /// The base path (`path`) is not included in the returned paths.
+    pub fn enumerate_recursive<P: AsRef<GuestPath>>(
+        &self,
+        path: P,
+    ) -> Result<Vec<GuestPathBuf>, ()> {
+        let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
+            return Err(());
+        };
+
+        let mut paths = Vec::new();
+        let mut component_stack: Vec<&str> = Vec::new();
+        let mut iterator_stack = vec![children.iter()];
+        loop {
+            let current_iterator = iterator_stack.last_mut().unwrap();
+            if let Some((next_component, next_node)) = current_iterator.next() {
+                component_stack.push(next_component);
+                paths.push(GuestPathBuf::from(component_stack.join("/")));
+                if let FsNode::Directory { children, .. } = next_node {
+                    iterator_stack.push(children.iter());
+                } else {
+                    component_stack.pop();
+                }
+            } else {
+                iterator_stack.pop();
+                if component_stack.pop().is_none() {
+                    break;
+                }
+            }
+        }
+        assert!(component_stack.is_empty() && iterator_stack.is_empty());
+        Ok(paths)
+    }
+
+    /// Like [std::fs::read] but for the guest filesystem.
+    pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
+        let mut file = self.open(path.as_ref())?;
+        let mut result = Vec::new();
+        file.read_to_end(&mut result).map_err(|_| ())?;
+        Ok(result)
+    }
+
+    /// Like [std::fs::write] but for the guest filesystem.
+    pub fn write<P: AsRef<GuestPath>>(&mut self, path: P, data: &[u8]) -> Result<(), ()> {
+        let mut options = GuestOpenOptions::new();
+        options.write().create().truncate();
+        self.open_with_options(path, options)?
+            .write_all(data)
+            .map_err(|_| ())
+    }
+
+    /// Like [File::open] but for the guest filesystem.
+    #[allow(dead_code)]
+    pub fn open<P: AsRef<GuestPath>>(&self, path: P) -> Result<GuestFile, ()> {
+        // Read-only opens follow the same case-insensitive lookup semantics as
+        // the iPhone OS app volume.  Keep open_with_options separate because a
+        // missing O_CREAT target must retain the caller's requested spelling.
+        let resolved_path = self
+            .resolve_case_insensitive_path(path.as_ref())
+            .ok_or(())?;
+        // It would be nice to delegate to self.open_with_options, but it
+        // currently wants a mutable reference to self.
+        let node = self.lookup_node(&resolved_path).ok_or(())?;
+        match node {
+            FsNode::File { location, .. } => match location {
+                FileLocation::Path(host_path) => {
+                    let host_file = handle_open_err(File::open(host_path), host_path);
+                    Ok(GuestFile::from_host_file(host_file))
+                }
+                FileLocation::IpaFileRef(file) => Ok(GuestFile::from_ipa_file(file)),
+                FileLocation::ResourceFilePath(name) => {
+                    let resource_file = handle_open_err(paths::ResourceFile::open(name), name);
+                    Ok(GuestFile::from_resource_file(resource_file))
+                }
+            },
+            FsNode::Directory { .. } => Err(()),
+        }
+    }
+
+    // ИСПРАВЛ��НИЕ: ЧЕСТНАЯ РЕАЛИЗАЦИЯ ПЕРЕИМЕНОВАНИЯ
+    // Поддерживает и файлы, и директории, обновляет дерево VFS без паники
+    pub fn rename<P: AsRef<GuestPath> + Copy>(&mut self, from: P, to: P) -> Result<(), ()> {
+        let from_path = from.as_ref();
+        let to_path = to.as_ref();
+
+        if from_path.as_str() == to_path.as_str() {
+            return Ok(());
+        }
+
+        let from_host_path = match self.lookup_node(from_path).ok_or(())? {
+            FsNode::File {
+                location: FileLocation::Path(p),
+                writeable: true,
+            } => p.clone(),
+            FsNode::Directory {
+                writeable: Some(p), ..
+            } => p.clone(),
+            _ => return Err(()), // Нельзя перемещать read-only или системные файлы архива
+        };
+
+        let (to_parent_node, to_name) = self.lookup_parent_node(to_path).ok_or(())?;
+        let to_parent_host_path = match to_parent_node {
+            FsNode::Directory {
+                writeable: Some(p), ..
+            } => p.clone(),
+            _ => return Err(()), // Нельзя перемещать в read-only родителя
+        };
+        let to_host_path = to_parent_host_path.join(&to_name);
+
+        // 1. Выполняем настоящее физическое перемещение на диске хоста
+        if fs::rename(&from_host_path, &to_host_path).is_err() {
+            return Err(());
+        }
+
+        // 2. Извлекаем старую ноду из VFS
+        let (from_parent_node, from_name) = self.lookup_parent_node(from_path).unwrap();
+        let FsNode::Directory {
+            children: from_children,
+            ..
+        } = from_parent_node
+        else {
+            unreachable!()
+        };
+        let mut moving_node = from_children.remove(&from_name).unwrap();
+
+        // 3. Рекурсивно обновляем внутри нее все Host-пути на новые
+        moving_node.update_host_paths_recursively(to_host_path);
+
+        // 4. Вставляем обновленную ноду по новому пути в VFS
+        let (to_parent_final, to_name_final) = self.lookup_parent_node(to_path).unwrap();
+        let FsNode::Directory {
+            children: to_children,
+            ..
+        } = to_parent_final
+        else {
+            unreachable!()
+        };
+        to_children.insert(to_name_final, moving_node);
+
+        Ok(())
+    }
+
+    /// Like [File::options] but for the guest filesystem.
+    pub fn open_with_options<P: AsRef<GuestPath>>(
+        &mut self,
+        path: P,
+        options: GuestOpenOptions,
+    ) -> Result<GuestFile, ()> {
+        let GuestOpenOptions {
+            read,
+            mut write, // ИСПРАВЛЕНИЕ: Разрешаем менять переменную
+            append,
+            create,
+            create_new,
+            truncate,
+        } = options;
+
+        // ИСПРАВЛЕНИЕ: Мягкий перехват вместо вызова panic!.
+        // Если запрашивается создание или очистка файла без права записи,
+        // принудительно даем право на запись.
+        if (truncate || create || create_new) && !write && !append {
+            log!("Warning: App tried to create/truncate file without write permissions. Forcing write = true.");
+            write = true;
+        }
+
+        let path = path.as_ref();
+
+        // We need to inspect the existing node (if any) and decide what to do,
+        // then release all borrows before doing any action that calls
+        // self.lookup_parent_node(&mut self) again.
+        // The action enum carries owned data so all borrows are released before
+        // the match on `action`.
+
+        // Open an existing file if possible
+
+        // What action to take after the borrow of `children` is released.
+        // Using an enum lets us exit the borrow scope before calling
+        // self.lookup_parent_node (which needs &mut self).
+        enum OpenAction {
+            /// Open a regular host file.
+            OpenPath(PathBuf),
+            /// Open an IPA bundle file read-only.
+            OpenIpa,
+            /// Open a resource file by name.
+            OpenResource(String),
+            /// Open a directory.
+            OpenDir,
+            /// Reject the request.
+            Reject,
+            /// Copy-on-Write: extract IPA content to this host path (content
+            /// may already be on disk if `Vec<u8>` is empty).
+            CowIpa(PathBuf, Vec<u8>),
+        }
+
+        // Clone the CoW base path before the mutable borrow of self.root.
+        let cow_base_opt: Option<PathBuf> = self.cow_dir.clone();
+
+        // First borrow scope: inspect existing node, collect all data we need.
+        let (existing_new_filename, action): (String, OpenAction) = {
+            let (parent_node, new_filename) = match self.lookup_parent_node(path) {
+                Some(r) => r,
+                None => return Err(()),
+            };
+            let children = match parent_node {
+                FsNode::Directory {
+                    children,
+                    writeable: _,
+                } => children,
+                _ => return Err(()),
+            };
+            if create_new && children.contains_key(&new_filename) {
+                // O_CREAT|O_EXCL semantics: opening an existing file with
+                // O_EXCL must fail (EEXIST), not open or truncate it.
+                return Err(());
+            }
+            let action: OpenAction = if let Some(existing_file) = children.get(&new_filename) {
+                match existing_file {
+                    &FsNode::File {
+                        ref location,
+                        writeable,
+                    } => {
+                        if !writeable && (append || write) {
+                            // Copy-on-Write for IPA bundle files.
+                            if let FileLocation::IpaFileRef(ipa_ref) = location {
+                                if let Some(cow_base) = cow_base_opt.clone() {
+                                    let guest_str = path.as_str();
+                                    let rel = guest_str.trim_start_matches('/');
+                                    let host_path =
+                                        rel.split('/').fold(cow_base, |acc, c| acc.join(c));
+                                    // Read the IPA content now while the borrow is valid.
+                                    let content = if !host_path.exists() {
+                                        let mut ipa_file = ipa_ref.open();
+                                        let mut buf = Vec::new();
+                                        match ipa_file.read_to_end(&mut buf) {
+                                            Ok(_) => buf,
+                                            Err(e) => {
+                                                log!(
+                                                    "CoW: failed to read IPA content for {:?}: {}",
+                                                    path,
+                                                    e
+                                                );
+                                                return Err(());
+                                            }
+                                        }
+                                    } else {
+                                        Vec::new() // already on disk
+                                    };
+                                    OpenAction::CowIpa(host_path, content)
+                                } else {
+                                    OpenAction::Reject
+                                }
+                            } else {
+                                OpenAction::Reject
+                            }
+                        } else {
+                            match location {
+                                FileLocation::Path(p) => OpenAction::OpenPath(p.clone()),
+                                FileLocation::IpaFileRef(_) => OpenAction::OpenIpa,
+                                FileLocation::ResourceFilePath(n) => {
+                                    OpenAction::OpenResource(n.clone())
+                                }
+                            }
+                        }
+                    }
+                    FsNode::Directory { .. } => {
+                        if write {
+                            OpenAction::Reject
+                        } else {
+                            OpenAction::OpenDir
+                        }
+                    }
+                }
+            } else {
+                // File does not exist yet — handled by the create-new path below.
+                OpenAction::Reject // placeholder; will be overridden
+            };
+            (new_filename, action)
+        }; // ← first borrow scope ends here; self.root is fully released
+
+        // --- borrow of children / parent_node is now fully released ---
+        let new_filename = existing_new_filename;
+
+        match action {
+            OpenAction::OpenPath(host_path) => {
+                let file = handle_open_err(
+                    File::options()
+                        .read(read)
+                        .write(write)
+                        .append(append)
+                        .create(false)
+                        .truncate(truncate)
+                        .open(&host_path),
+                    &host_path,
+                );
+                return Ok(GuestFile::File(file));
+            }
+            OpenAction::OpenIpa => {
+                // Re-look up to get the IpaFileRef (read-only, no borrow conflict).
+                let (pn, fname) = self.lookup_parent_node(path).ok_or(())?;
+                if let FsNode::Directory { children, .. } = pn {
+                    if let Some(FsNode::File {
+                        location: FileLocation::IpaFileRef(f),
+                        ..
+                    }) = children.get(&fname)
+                    {
+                        return Ok(GuestFile::from_ipa_file(f));
+                    }
+                }
+                return Err(());
+            }
+            OpenAction::OpenResource(name) => {
+                let resource_file = handle_open_err(paths::ResourceFile::open(&name), &name);
+                return Ok(GuestFile::from_resource_file(resource_file));
+            }
+            OpenAction::OpenDir => {
+                return Ok(GuestFile::from_directory());
+            }
+            OpenAction::Reject => {
+                // File doesn't exist yet — fall through to the create-new path
+                // below.  Write-to-read-only is already handled by returning
+                // Err(()) inside the action computation block above.
+            }
+            OpenAction::CowIpa(host_path, content) => {
+                // Write the IPA content to the CoW location if needed.
+                if !content.is_empty() {
+                    if let Some(parent) = host_path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            log!(
+                                "CoW: failed to create directories for {:?}: {}",
+                                host_path,
+                                e
+                            );
+                            return Err(());
+                        }
+                    }
+                    if let Err(e) = std::fs::write(&host_path, &content) {
+                        log!("CoW: failed to write CoW copy to {:?}: {}", host_path, e);
+                        return Err(());
+                    }
+                    log!(
+                        "CoW: extracted IPA bundle file {:?} to {:?}",
+                        path,
+                        host_path
+                    );
+                }
+                // Upgrade the VFS node (self.root borrow is free now).
+                if let Some((parent_node_mut, fname)) = self.lookup_parent_node(path) {
+                    if let FsNode::Directory { children, .. } = parent_node_mut {
+                        children.insert(
+                            fname,
+                            FsNode::File {
+                                location: FileLocation::Path(host_path.clone()),
+                                writeable: true,
+                            },
+                        );
+                    }
+                }
+                let file = handle_open_err(
+                    File::options()
+                        .read(read)
+                        .write(write)
+                        .append(append)
+                        .create(false)
+                        .truncate(truncate)
+                        .open(&host_path),
+                    &host_path,
+                );
+                return Ok(GuestFile::File(file));
+            }
+        }
+
+        // Create a new file: re-borrow the parent directory.
+        if !create && !create_new {
+            return Err(());
+        }
+
+        let (parent_node2, new_filename2) = self.lookup_parent_node(path).ok_or(())?;
+        let FsNode::Directory {
+            children: children2,
+            writeable: dir_host_path2,
+        } = parent_node2
+        else {
+            return Err(());
+        };
+
+        let Some(dir_host_path2) = dir_host_path2 else {
+            log!(
+                "Warning: attempt to create file at path {:?}, but directory is read-only",
+                path
+            );
+            return Err(());
+        };
+
+        for c in new_filename2.chars() {
+            if std::path::is_separator(c) {
+                log!("Warning: attempt to create file at path {:?} with separator {:?}", path, c);
+                return Err(());
+            }
+        }
+
+        let host_path = dir_host_path2.join(&new_filename2);
+        let file = handle_open_err(
+            File::options()
+                .read(read)
+                .write(write)
+                .append(append)
+                .create(create || create_new)
+                .truncate(truncate)
+                .open(&host_path),
+            &host_path,
+        );
+        log_dbg!(
+            "Created file at path {:?} (host path: {:?})",
+            path,
+            host_path
+        );
+        children2.insert(
+            new_filename2,
+            FsNode::File {
+                location: FileLocation::Path(host_path),
+                writeable: true,
+            },
+        );
+        Ok(GuestFile::File(file))
+    }
+
+    /// Removes a file or a directory.
+    /// If the node is a directory, it must be
+    /// empty.
+    pub fn remove<P: AsRef<GuestPath>>(&mut self, path: P) -> Result<(), FsError> {
+        let path = path.as_ref();
+        let (parent_node, node_name) = self
+            .lookup_parent_node(path)
+            .ok_or(FsError::NonexistentParentDir)?;
+        // Parent directory is not a directory
+        let FsNode::Directory {
+            children,
+            writeable: dir_writeable,
+        } = parent_node
+        else {
+            return Err(FsError::InvalidParentDir);
+        };
+
+        if !dir_writeable.is_some() {
+            log!("Warning: attempt to delete file or directroy at path {:?}, but parent directory is read-only", path);
+            return Err(FsError::ReadonlyParentDir);
+        };
+
+        let Some(node) = children.get(&node_name) else {
+            // There is no file/directory with this name
+            return Err(FsError::DoesNotExist);
+        };
+
+        match node {
+            FsNode::File {
+                location,
+                writeable,
+            } => {
+                // Read-only files can't be removed.
+                // (This is probably not
+                // correct, but it is safer for now.)
+                if !writeable {
+                    return Err(FsError::AccessDenied);
+                }
+
+                let host_path = match location {
+                    FileLocation::Path(host_path) => host_path,
+                    FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => {
+                        return Err(FsError::AccessDenied);
+                    }
+                };
+                handle_open_err(std::fs::remove_file(host_path), host_path);
+                log_dbg!(
+                    "Deleted file at path {:?} (host path: {:?})",
+                    path,
+                    host_path
+                );
+            }
+            FsNode::Directory {
+                children,
+                writeable,
+            } => {
+                // Directory is not empty
+                if !children.is_empty() {
+                    return Err(FsError::DirectoryNotEmpty);
+                }
+                // Read-only directories can't be removed.
+                // (This is probably not
+                // correct, but it is safer for now.)
+                let Some(host_path) = writeable else {
+                    return Err(FsError::AccessDenied);
+                };
+
+                handle_open_err(std::fs::remove_dir(host_path), host_path);
+                log_dbg!(
+                    "Deleted directory at path {:?} (host path: {:?})",
+                    path,
+                    host_path
+                );
+            }
+        }
+
+        children.remove(&node_name).unwrap();
+        Ok(())
+    }
+
+    /// Like [std::fs::create_dir_all] but for the guest filesystem.
+    pub fn create_dir_all<P: AsRef<GuestPath>>(&mut self, path: P) -> Result<(), FsError> {
+        let path = path.as_ref();
+
+        // 1. Получаем компоненты пути.
+        // .into_iter().map(|s| s.to_string()).collect() — КРИТИЧЕСКИ ВАЖНО.
+        // Это превращает Vec<&str> в Vec<String>, освобождая self от
+        // заимствования.
+        let components: Vec<String> = resolve_path(path, Some(&self.working_directory))
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut current_path = String::new();
+
+        // 2. Теперь мы можем спокойно итерироваться и вызывать мутабельные
+        // методы self
+        for component in components {
+            // Собираем путь по кусочкам: /var -> /var/mobile ->
+            // /var/mobile/Applications...
+            current_path.push('/');
+            current_path.push_str(&component);
+
+            let res = self.create_dir(GuestPathBuf::from(current_path.clone()));
+            match res {
+                Ok(_) | Err(FsError::AlreadyExist) => {
+                    // Если папка уже есть — это нормально, идем дальше к
+                    // вложенным
+                }
+                _ => return res, // Если другая ошибка (нет прав и т.д.) — выходим
+            }
+        }
+        Ok(())
+    }
+
+    /// Like [std::fs::create_dir] but for the guest filesystem.
+    pub fn create_dir<P: AsRef<GuestPath>>(&mut self, path: P) -> Result<(), FsError> {
+        let path = path.as_ref();
+        let (parent_node, new_dir_name) = self
+            .lookup_parent_node(path)
+            .ok_or(FsError::NonexistentParentDir)?;
+        // Parent directory is not a directory
+        let FsNode::Directory {
+            children,
+            writeable: dir_host_path,
+        } = parent_node
+        else {
+            return Err(FsError::InvalidParentDir);
+        };
+
+        // There's already a file/directory with this name
+        if children.contains_key(&new_dir_name) {
+            return Err(FsError::AlreadyExist);
+        }
+
+        let Some(dir_host_path) = dir_host_path else {
+            log!("Warning: attempt to create directory at path {:?}, but parent directory is read-only", path);
+            return Err(FsError::ReadonlyParentDir);
+        };
+
+        for c in new_dir_name.chars() {
+            if std::path::is_separator(c) {
+                log!("Warning: attempt to create directory at path {:?} with separator {:?}", path, c);
+                return Err(FsError::InvalidParentDir);
+            }
+        }
+
+        let host_path = dir_host_path.join(&new_dir_name);
+        // Use create_dir but tolerate AlreadyExists — the directory may exist
+        // on disk from a previous run even though it was not in the in-memory
+        // filesystem tree (e.g. the tree was rebuilt on launch while the host
+        // directory was preserved).
+        match std::fs::create_dir(&host_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The directory already exists on the host — this is fine.
+                log_dbg!(
+                    "create_dir: host directory already exists at {:?}, reusing",
+                    host_path
+                );
+            }
+            Err(e) => {
+                handle_open_err(Err::<(), _>(e), &host_path);
+            }
+        }
+        log_dbg!(
+            "Created directory at path {:?} (host path: {:?})",
+            path,
+            host_path
+        );
+        children.insert(
+            new_dir_name,
+            FsNode::Directory {
+                children: HashMap::new(),
+                writeable: Some(host_path),
+            },
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn case_test_fs() -> Fs {
+        let bundle = FsNode::dir().with_child(
+            "Data",
+            FsNode::dir().with_child(
+                "data.unity3d",
+                FsNode::resource_file("test-data.unity3d".to_string()),
+            ),
+        );
+        Fs {
+            root: FsNode::dir().with_child(
+                "Var",
+                FsNode::dir().with_child(
+                    "Mobile",
+                    FsNode::dir().with_child(
+                        "Applications",
+                        FsNode::dir().with_child(
+                            "UUID",
+                            FsNode::dir().with_child("Granny.app", bundle),
+                        ),
+                    ),
+                ),
+            ),
+            working_directory: GuestPathBuf::from(
+                "/Var/Mobile/Applications/UUID/Granny.app".to_string(),
+            ),
+            home_directory: GuestPathBuf::from("/Var/Mobile/Applications/UUID".to_string()),
+            cow_dir: None,
+        }
+    }
+
+    #[test]
+    fn resolves_case_insensitively_and_normalizes_relative_paths() {
+        let fs = case_test_fs();
+        let absolute: String = fs
+            .resolve_case_insensitive_path(GuestPath::new(
+                "/var/mobile/applications/uuid/granny.app/DATA/DATA.UNITY3D",
+            ))
+            .unwrap()
+            .into();
+        assert_eq!(
+            absolute,
+            "/Var/Mobile/Applications/UUID/Granny.app/Data/data.unity3d"
+        );
+
+        let relative: String = fs
+            .resolve_case_insensitive_path(GuestPath::new("./data/../DATA/data.UNITY3D"))
+            .unwrap()
+            .into();
+        assert_eq!(
+            relative,
+            "/Var/Mobile/Applications/UUID/Granny.app/Data/data.unity3d"
+        );
+        assert!(fs
+            .resolve_case_insensitive_path(GuestPath::new("Data/not-present"))
+            .is_none());
+    }
+}

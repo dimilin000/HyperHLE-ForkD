@@ -1,0 +1,388 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! `CAAnimation` and its subclasses
+use std::collections::HashMap;
+
+use crate::dyld::{ConstantExports, HostConstant};
+use crate::frameworks::core_animation::ca_media_timing_function::kCAMediaTimingFunctionDefault;
+use crate::frameworks::core_foundation::time::CFTimeInterval;
+use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
+use crate::objc::{id, nil, objc_classes, release, retain, ClassExports};
+use crate::{msg, msg_class};
+use crate::{Environment, ThreadId};
+
+#[derive(Default)]
+pub struct State {
+    // TODO: Clean up state from threads that finish
+    transactions: HashMap<ThreadId, ThreadState>,
+}
+impl State {
+    pub fn get(env: &mut Environment) -> &State {
+        &env.framework_state.core_animation.ca_transaction
+    }
+
+    pub fn get_mut(env: &mut Environment) -> &mut State {
+        &mut env.framework_state.core_animation.ca_transaction
+    }
+
+    pub fn get_current_transaction(env: &mut Environment) -> Option<&Transaction> {
+        let current_thread = env.current_thread;
+        State::get(env)
+            .transactions
+            .get(&current_thread)
+            .and_then(|t| t.get_current_transaction())
+    }
+
+    fn get_current_transaction_mut(env: &mut Environment) -> Option<&mut Transaction> {
+        let current_thread = env.current_thread;
+        State::get_mut(env)
+            .transactions
+            .get_mut(&current_thread)
+            .and_then(|t| t.get_current_transaction_mut())
+    }
+
+    // Used by CALayer implicit animations (see ca_layer.rs
+    // add_default_implied_basic_animation).
+    pub fn add_animation(env: &mut Environment, layer: id, animation: id) {
+        let layer_class = msg![env; layer class];
+        let ca_layer = env.objc.get_known_class("CALayer", &mut env.mem);
+        assert!(env.objc.class_is_subclass_of(layer_class, ca_layer));
+        let anim_class = msg![env; animation class];
+        let ca_animation = env.objc.get_known_class("CAAnimation", &mut env.mem);
+        retain(env, layer);
+        retain(env, animation);
+        assert!(env.objc.class_is_subclass_of(anim_class, ca_animation));
+        if let Some(transaction) = State::get_current_transaction_mut(env) {
+            transaction.add_animation(layer, animation);
+        } else {
+            let mut transaction = Transaction::new(env);
+            transaction.add_animation(layer, animation);
+            let thread_state = State::get_current_thread_state_mut(env);
+            if let Some(existing) = thread_state.implicit_transaction.as_mut() {
+                for (l, a) in transaction.animations {
+                    existing.add_animation(l, a);
+                }
+            } else {
+                thread_state.implicit_transaction = Some(transaction);
+            }
+        };
+    }
+
+    pub fn commit_implicit_transaction(env: &mut Environment) {
+        loop {
+            let explicit = State::pop_explicit_transaction(env);
+            if let Some(tx) = explicit {
+                tx.commit(env);
+            } else {
+                break;
+            }
+        }
+        let state = State::get_current_thread_state_mut(env);
+        if let Some(transaction) = std::mem::take(&mut state.implicit_transaction) {
+            transaction.commit(env);
+        }
+    }
+
+    fn get_current_thread_state_mut(env: &mut Environment) -> &mut ThreadState {
+        let current_thread = env.current_thread;
+        State::get_mut(env)
+            .transactions
+            .entry(current_thread)
+            .or_default()
+    }
+
+    fn push_explicit_transaction(env: &mut Environment) {
+        let transaction = Transaction::new(env);
+        State::get_current_thread_state_mut(env)
+            .explicit_transactions
+            .push(transaction);
+    }
+
+    fn pop_explicit_transaction(env: &mut Environment) -> Option<Transaction> {
+        let current_thread = env.current_thread;
+        State::get_mut(env)
+            .transactions
+            .get_mut(&current_thread)
+            .and_then(|thread_state| thread_state.explicit_transactions.pop())
+    }
+}
+
+#[derive(Default)]
+struct ThreadState {
+    implicit_transaction: Option<Transaction>,
+    explicit_transactions: Vec<Transaction>,
+}
+impl ThreadState {
+    fn get_current_transaction(&self) -> Option<&Transaction> {
+        self.explicit_transactions
+            .last()
+            .or(self.implicit_transaction.as_ref())
+    }
+
+    fn get_current_transaction_mut(&mut self) -> Option<&mut Transaction> {
+        self.explicit_transactions
+            .last_mut()
+            .or(self.implicit_transaction.as_mut())
+    }
+}
+
+pub struct Transaction {
+    disable_actions: bool,
+    animation_duration: CFTimeInterval,
+    animation_timing_function: id, // CAMediaTimingFunction*
+    completion_block: id,
+    data: HashMap<String, id>,
+    animations: Vec<(id, id)>, // CALayer*, CAAnimation*
+}
+impl Transaction {
+    fn new(env: &mut Environment) -> Self {
+        let animation_timing_function_name = get_static_str(env, kCAMediaTimingFunctionDefault);
+        let animation_timing_function =
+            msg_class![env; CAMediaTimingFunction functionWithName:animation_timing_function_name];
+        Self {
+            disable_actions: false,
+            animation_duration: 0.25,
+            animation_timing_function,
+            completion_block: nil,
+            data: HashMap::default(),
+            animations: Vec::default(),
+        }
+    }
+
+    // Unused until support for UIView animations is implemented.
+    #[allow(unused)]
+    pub fn get_animations(&self) -> Vec<(id, id)> {
+        self.animations.clone()
+    }
+
+    fn add_animation(&mut self, layer: id, animation: id) {
+        self.animations.push((layer, animation));
+    }
+
+    fn commit(self, env: &mut Environment) {
+        for (layer, animation) in self.animations {
+            if !self.disable_actions {
+                () = msg![env; animation setDuration: (self.animation_duration)];
+                () = msg![env; animation setTimingFunction: (self.animation_timing_function)];
+                () = msg![env; layer addAnimation: animation forKey: nil];
+            }
+            release(env, layer);
+            release(env, animation);
+        }
+
+        for (_key, value) in self.data {
+            release(env, value);
+        }
+
+        if self.completion_block != nil {
+            let invoke_ptr_addr: crate::mem::ConstPtr<crate::abi::GuestFunction> =
+                crate::mem::Ptr::from_bits(self.completion_block.to_bits() + 12);
+            if env.mem.get_bytes_fallible(invoke_ptr_addr.cast(), 4).is_some() {
+                let invoke_func = env.mem.read(invoke_ptr_addr);
+                if invoke_func.addr_without_thumb_bit() != 0 {
+                    use crate::abi::CallFromHost;
+                    let _: () = invoke_func.call_from_host(env, (self.completion_block,));
+                }
+            }
+            release(env, self.completion_block);
+        }
+    }
+}
+
+pub const kCATransactionAnimationDuration: &str = "animationDuration";
+pub const kCATransactionDisableActions: &str = "disableActions";
+pub const kCATransactionAnimationTimingFunction: &str = "animationTimingFunction";
+pub const kCATransactionCompletionBlock: &str = "completionBlock";
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_kCATransactionAnimationDuration",
+        HostConstant::NSString(kCATransactionAnimationDuration),
+    ),
+    (
+        "_kCATransactionDisableActions",
+        HostConstant::NSString(kCATransactionDisableActions),
+    ),
+    (
+        "_kCATransactionAnimationTimingFunction",
+        HostConstant::NSString(kCATransactionAnimationTimingFunction),
+    ),
+    (
+        "_kCATransactionCompletionBlock",
+        HostConstant::NSString(kCATransactionCompletionBlock),
+    ),
+];
+
+pub const CLASSES: ClassExports = objc_classes! {
+
+(env, this, _cmd);
+
+@implementation CATransaction: NSObject
+
++ (())setValue:(id)value forKey:(id)key {
+    let key_string = to_rust_string(env, key);
+    log_dbg!("[CATransaction setValue:{:?} forKey:{:?} ({})]", value, key, key_string);
+    match &*key_string  {
+        kCATransactionAnimationDuration => {
+            let value: CFTimeInterval = msg![env; value doubleValue];
+            if let Some(transaction) = State::get_current_transaction_mut(env) {
+                transaction.animation_duration = value;
+            } else {
+                log!("Warning: [CATransaction setValue:forKey:kCATransactionAnimationDuration] called outside a transaction; ignoring.");
+            }
+        },
+        kCATransactionDisableActions => {
+            let value: bool = msg![env; value boolValue];
+            if let Some(transaction) = State::get_current_transaction_mut(env) {
+                transaction.disable_actions = value;
+            } else {
+                log!("Warning: [CATransaction setValue:forKey:kCATransactionDisableActions] called outside a transaction; ignoring.");
+            }
+        },
+        kCATransactionAnimationTimingFunction => {
+            if let Some(transaction) = State::get_current_transaction_mut(env) {
+                let old_value = std::mem::replace(&mut transaction.animation_timing_function, value);
+                retain(env, value);
+                release(env, old_value);
+            } else {
+                log!("Warning: [CATransaction setValue:forKey:kCATransactionAnimationTimingFunction] called outside a transaction; ignoring.");
+            }
+        },
+        kCATransactionCompletionBlock => {
+            if let Some(transaction) = State::get_current_transaction_mut(env) {
+                let copied: id = if value != nil { msg![env; value copy] } else { nil };
+                let old = std::mem::replace(&mut transaction.completion_block, copied);
+                if old != nil {
+                    release(env, old);
+                }
+            }
+        },
+        _ => {
+            if let Some(transaction) = State::get_current_transaction_mut(env) {
+                let old_value = transaction.data.insert(key_string.to_string(), value).unwrap_or(nil);
+                retain(env, value);
+                release(env, old_value);
+            } else {
+                log!(
+                    "Warning: [CATransaction setValue:{:?} forKey:{:?}] called outside a transaction; ignoring.",
+                    value,
+                    key_string
+                );
+            }
+        }
+    };
+}
++ (id)valueForKey:(id)key { // NSString*
+    let key_string = to_rust_string(env, key);
+    let value = match &*key_string {
+        kCATransactionAnimationDuration => {
+            let animation_duration = State::get_current_transaction(env)
+                .map(|t| t.animation_duration)
+                .unwrap_or(0.25);
+            msg_class![env; NSNumber numberWithDouble:animation_duration]
+        },
+        kCATransactionDisableActions => {
+            let disable_actions = State::get_current_transaction(env)
+                .map(|t| t.disable_actions)
+                .unwrap_or(false);
+            msg_class![env; NSNumber numberWithBool:disable_actions]
+        },
+        kCATransactionAnimationTimingFunction => {
+            State::get_current_transaction(env)
+                .map(|t| t.animation_timing_function)
+                .unwrap_or_else(|| {
+                    let animation_timing_function_name = get_static_str(env, kCAMediaTimingFunctionDefault);
+                    msg_class![env; CAMediaTimingFunction functionWithName:animation_timing_function_name]
+                })
+        },
+        kCATransactionCompletionBlock => {
+            State::get_current_transaction(env)
+                .map(|t| t.completion_block)
+                .unwrap_or(nil)
+        },
+        _ => {
+            State::get_current_transaction(env)
+                .and_then(|t| t.data.get(&*key_string).cloned())
+                .unwrap_or(nil)
+        }
+    };
+    log_dbg!("[CATransaction valueForKey:{:?} ({})] => {:?}", key, key_string, value);
+    value
+}
+
++ (())begin {
+    log_dbg!("[CATransaction begin]");
+    State::push_explicit_transaction(env);
+}
+
++ (())commit {
+    log_dbg!("[CATransaction commit]");
+    if let Some(transaction) = State::pop_explicit_transaction(env) {
+        transaction.commit(env);
+    } else {
+        log!("Warning: [CATransaction commit] called without a matching begin; ignoring.");
+    }
+}
+
++ (bool)disableActions {
+    let key = get_static_str(env, kCATransactionDisableActions);
+    let value = msg![env; this valueForKey: key];
+    msg![env; value boolValue]
+}
++ (())setDisableActions:(bool)flag {
+    let value: id = msg_class![env; NSNumber numberWithBool: flag];
+    let key = get_static_str(env, kCATransactionDisableActions);
+    msg![env; this setValue: value forKey: key]
+}
+
++ (CFTimeInterval)animationDuration {
+    let key = get_static_str(env, kCATransactionAnimationDuration);
+    let value = msg![env; this valueForKey: key];
+    msg![env; value doubleValue]
+}
++ (())setAnimationDuration:(CFTimeInterval)duration {
+    let value: id = msg_class![env; NSNumber numberWithDouble: duration];
+    let key = get_static_str(env, kCATransactionAnimationDuration);
+    msg![env; this setValue: value forKey: key]
+}
+
++ (id)animationTimingFunction {
+    let key = get_static_str(env, kCATransactionAnimationTimingFunction);
+    msg![env; this valueForKey: key]
+}
++ (())setAnimationTimingFunction:(id)animation_timing_function { // CAMediaTimingFunction *
+    let key = get_static_str(env, kCATransactionAnimationTimingFunction);
+    msg![env; this setValue: animation_timing_function forKey: key]
+}
+
++ (id)completionBlock {
+    let key = get_static_str(env, kCATransactionCompletionBlock);
+    msg![env; this valueForKey: key]
+}
+
++ (())setCompletionBlock:(id)block {
+    let key = get_static_str(env, kCATransactionCompletionBlock);
+    msg![env; this setValue: block forKey: key]
+}
+
++ (())flush {
+    log_dbg!("[CATransaction flush]");
+    let state = State::get_current_thread_state_mut(env);
+    if let Some(transaction) = std::mem::take(&mut state.implicit_transaction) {
+        transaction.commit(env);
+    }
+}
+
++ (())lock {
+    log_dbg!("[CATransaction lock]");
+}
+
++ (())unlock {
+    log_dbg!("[CATransaction unlock]");
+}
+@end
+
+};

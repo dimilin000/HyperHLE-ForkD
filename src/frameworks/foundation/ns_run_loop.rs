@@ -1,0 +1,520 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! `NSRunLoop`.
+//!
+//! Resources:
+//! - Apple's [Threading Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/Introduction/Introduction.html)
+
+use super::{ns_port, ns_string, ns_timer, NSTimeInterval};
+use crate::dyld::{ConstantExports, HostConstant};
+use crate::environment::ThreadId;
+use crate::frameworks::audio_toolbox::audio_queue::{handle_audio_queue, AudioQueueRef};
+use crate::frameworks::audio_toolbox::audio_services::tick_system_sound_completions;
+use crate::frameworks::audio_toolbox::audio_unit::{render_audio_unit, AudioUnit};
+use crate::frameworks::core_animation::ca_transaction;
+use crate::frameworks::core_foundation::cf_run_loop::{
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
+};
+use crate::frameworks::{core_animation, media_player, uikit};
+use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
+use crate::Environment;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+/// `NSString*`
+pub type NSRunLoopMode = id;
+// FIXME: Maybe this shouldn't be the same value? See: https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html
+pub const NSRunLoopCommonModes: &str = kCFRunLoopCommonModes;
+pub const NSDefaultRunLoopMode: &str = kCFRunLoopDefaultMode;
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_NSRunLoopCommonModes",
+        HostConstant::NSString(NSRunLoopCommonModes),
+    ),
+    (
+        "_NSDefaultRunLoopMode",
+        HostConstant::NSString(NSDefaultRunLoopMode),
+    ),
+];
+
+#[derive(Default)]
+pub struct ThreadLocalState {
+    run_loop: id,
+}
+
+#[derive(Default)]
+pub(crate) struct NSRunLoopHostObject {
+    audio_units: Vec<AudioUnit>,
+    /// Weak reference. Audio queue must remove itself when destroyed (TODO).
+    /// They are in no particular order.
+    audio_queues: Vec<AudioQueueRef>,
+    /// Strong references to `NSTimer*` in no particular order. Timers are owned
+    /// by the run loop. The timer must remove itself when invalidated.
+    timers: Vec<id>,
+    /// Strong references to `CFRunLoopSourceRef` objects (toll-free bridged
+    /// via `_touchHLE_CFRunLoopSource`) currently registered in this run
+    /// loop, per Apple's CFRunLoopAddSource semantics.
+    pub(crate) sources: Vec<id>,
+    /// Strong references to `NSPort*` objects registered via
+    /// `-[NSRunLoop addPort:forMode:]`. The run loop owns its scheduled ports
+    /// (per Apple's docs), so we retain them here and release on removal.
+    /// touchHLE has no Mach message sources, so these ports never deliver
+    /// input, but tracking them keeps ownership correct and lets apps that
+    /// attach a port purely to keep `-[NSRunLoop run]` alive work.
+    ports: Vec<id>,
+    /// Set by CFRunLoopStop; cleared at the start of the next run.
+    pub(crate) stopped: bool,
+}
+impl HostObject for NSRunLoopHostObject {}
+
+pub const CLASSES: ClassExports = objc_classes! {
+
+(env, this, _cmd);
+
+@implementation NSRunLoop: NSObject
+
++ (id)mainRunLoop {
+    run_loop_for_thread(env, this, 0)
+}
+
++ (id)currentRunLoop {
+    run_loop_for_thread(env, this, env.current_thread)
+}
+
+// TODO: more accessors
+
+- (id) retain { this }
+- (()) release {}
+- (id) autorelease { this }
+
+- (bool)runMode:(id)_mode beforeDate:(id)limit_date {
+    // Run the run loop for one iteration, honouring the caller's time limit.
+    // Apps frequently call this in a synchronous spin like:
+    //
+    //     while (!flag) {
+    //         [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+    //                                  beforeDate:[NSDate distantFuture]];
+    //     }
+    //
+    // expecting each pass to drain timers/sources (in particular the
+    // `performSelectorOnMainThread:withObject:waitUntilDone:` timers we
+    // queue with `afterDelay:0.0`). A no-op stub here causes any such app
+    // to spin forever in the guest, never letting the scheduled selectors
+    // fire (e.g. Angry Birds 1.0 hangs after preloading INGAME_*.pvr
+    // because the asset-load completion handler never gets a chance to
+    // run). Returning `true` matches the docs ("the input source was
+    // processed").
+    let time_limit: Option<NSTimeInterval> = if limit_date == nil {
+        None
+    } else {
+        Some(msg![env; limit_date timeIntervalSince1970])
+    };
+    log_dbg!(
+        "[(NSRunLoop*){:?} runMode:_ beforeDate:{:?}] limit={:?}",
+        this,
+        limit_date,
+        time_limit
+    );
+    run_run_loop(env, this, /* single_iteration: */ true, time_limit);
+    true
+}
+
+- (CFRunLoopRef)getCFRunLoop {
+    // In our implementation these are the same type (they aren't in Apple's).
+    this
+}
+
+// Adds a port as an input source to the run loop. See:
+// https://developer.apple.com/documentation/foundation/nsrunloop/1417511-addport
+// touchHLE has no Mach message delivery, so the port never fires an input
+// source, but the run loop takes ownership of it (retains it) exactly as
+// Cocoa does. Many old games attach a port only to keep `-[NSRunLoop run]`
+// from returning immediately; our `run_run_loop` already loops until stopped,
+// so this just needs to retain/track the port without crashing.
+- (())addPort:(id)port // NSPort*
+      forMode:(NSRunLoopMode)mode {
+    if port == nil {
+        log!("Warning: -[NSRunLoop addPort:nil forMode:] ignored");
+        return;
+    }
+    log_dbg!(
+        "[(NSRunLoop*){:?} addPort:{:?} forMode:{:?}]",
+        this,
+        port,
+        mode,
+    );
+    // Avoid double-retaining the same port for the same run loop.
+    if env.objc.borrow::<NSRunLoopHostObject>(this).ports.contains(&port) {
+        return;
+    }
+    ns_port::retain_port(env, port);
+    env.objc.borrow_mut::<NSRunLoopHostObject>(this).ports.push(port);
+}
+
+// Removes a port previously added with `addPort:forMode:`. See:
+// https://developer.apple.com/documentation/foundation/nsrunloop/1408625-removeport
+- (())removePort:(id)port // NSPort*
+         forMode:(NSRunLoopMode)mode {
+    if port == nil {
+        return;
+    }
+    log_dbg!(
+        "[(NSRunLoop*){:?} removePort:{:?} forMode:{:?}]",
+        this,
+        port,
+        mode,
+    );
+    let maybe_idx = env
+        .objc
+        .borrow::<NSRunLoopHostObject>(this)
+        .ports
+        .iter()
+        .position(|&p| p == port);
+    if let Some(idx) = maybe_idx {
+        env.objc.borrow_mut::<NSRunLoopHostObject>(this).ports.remove(idx);
+        ns_port::release_port(env, port);
+    }
+}
+
+- (())addTimer:(id)timer // NSTimer*
+       forMode:(NSRunLoopMode)mode {
+    let _default_mode = ns_string::get_static_str(env, NSDefaultRunLoopMode);
+    let _common_modes = ns_string::get_static_str(env, NSRunLoopCommonModes);
+    // TODO: handle other modes
+    // assert!(msg![env; mode isEqualToString:default_mode] || msg![env; mode
+    // isEqualToString:common_modes]);
+
+    log_dbg!(
+        "Adding timer {:?} to run loop {:?} with mode {:?}",
+        timer,
+        this,
+        ns_string::to_rust_string(env, mode),
+    );
+
+    // FIX: Check if the timer is already in the list. If it is, exit early to
+    // prevent duplicate entries and subsequent assertion panics on removal.
+    if env.objc.borrow::<NSRunLoopHostObject>(this).timers.contains(&timer) {
+        log_dbg!("Timer {:?} is already in run loop {:?}, ignoring duplicate addition.", timer, this);
+        return;
+    }
+
+    retain(env, timer);
+
+    let host_object = env.objc.borrow_mut::<NSRunLoopHostObject>(this);
+    host_object.timers.push(timer);
+    ns_timer::set_run_loop(env, timer, this);
+}
+
+- (())cancelPerformSelectorsWithTarget:(id)target {
+        if target == nil {
+            return;
+        }
+
+        log_dbg!("NSRunLoop: cancelPerformSelectorsWithTarget: {:?}", target);
+
+        // Клонируем список таймеров, так как вызов invalidate приведет к
+        // удалению таймера из списка (через remove_timer), что изменит массив.
+        let timers = env.objc.borrow::<NSRunLoopHostObject>(this).timers.clone();
+
+        // Делаем локальный retain всех таймеров, чтобы избежать use-after-free,
+        // аналогично тому, как это сделано ниже в функции `run_run_loop`.
+        for &timer in &timers {
+            retain(env, timer);
+        }
+
+        for &timer in &timers {
+            // Запрашиваем целевой объект у таймера напрямую через сообщение.
+            let timer_target: id = msg![env; timer target];
+
+            // Если цель совпадает, инвалидируем таймер (он сам удалится из run
+            // loop)
+            if timer_target == target {
+                log_dbg!("NSRunLoop: invalidating timer {:?} for target {:?}", timer, target);
+                let _: () = msg![env; timer invalidate];
+            }
+
+            // Отпускаем локальный retain
+            release(env, timer);
+        }
+}
+
+- (())run {
+    run_run_loop(env, this, /* single_iteration: */ false, None);
+}
+
+- (())runUntilDate:(id)date {
+    let time_limit: NSTimeInterval = msg![env; date timeIntervalSince1970];
+    run_run_loop(env, this, /* single_iteration: */ false, Some(time_limit));
+}
+
+// TODO: other run methods
+
+@end
+
+};
+
+/// For use by Audio Toolbox.
+pub fn add_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) {
+    env.objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_units
+        .push(unit);
+}
+
+/// For use by Audio Toolbox.
+pub fn remove_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) -> Result<(), ()> {
+    let units = &mut env
+        .objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_units;
+    if let Some(unit_idx) = units.iter().position(|&item| item == unit) {
+        units.remove(unit_idx);
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// For use by Audio Toolbox.
+/// TODO: Maybe replace this with a `CFRunLoopObserver` or some other generic
+/// mechanism?
+/// TODO: Handle run loop modes. Currently assumes the common modes.
+pub fn add_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueueRef) {
+    let queues = &mut env
+        .objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_queues;
+    if !queues.contains(&queue) {
+        queues.push(queue);
+    }
+}
+
+/// For use by Audio Toolbox.
+pub fn remove_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueueRef) {
+    let queues = &mut env
+        .objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_queues;
+    if let Some(queue_idx) = queues.iter().position(|&item| item == queue) {
+        queues.remove(queue_idx);
+    }
+}
+
+/// For use by NSTimer so it can remove itself once it's invalidated.
+pub(super) fn remove_timer(env: &mut Environment, run_loop: id, timer: id) {
+    log_dbg!("Removing timer {:?} from run loop {:?}", timer, run_loop);
+
+    // Честная логика Objective-C: если run_loop равен nil, нам не откуда
+    // удалять таймер.
+    if run_loop == nil {
+        return;
+    }
+
+    let NSRunLoopHostObject { timers, .. } = env.objc.borrow_mut(run_loop);
+
+    let mut i = 0;
+    let mut release_count = 0;
+    while i < timers.len() {
+        if timers[i] == timer {
+            timers.swap_remove(i);
+            release_count += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Убираем жесткий assert!(release_count == 1);
+    // В iOS таймер мог быть отменен до добавления в цикл или отменен дважды.
+    // Мы просто делаем release столько раз, сколько реально удалили из массива.
+    for _ in 0..release_count {
+        release(env, timer);
+    }
+}
+
+/// Run the run loop for just a single iteration. Used by the app picker and
+/// by `-[NSRunLoop runMode:beforeDate:]`.
+pub fn run_run_loop_single_iteration(env: &mut Environment, run_loop: id) {
+    run_run_loop(env, run_loop, /* single_iteration: */ true, None)
+}
+
+pub fn run_run_loop(
+    env: &mut Environment,
+    run_loop: id,
+    single_iteration: bool,
+    unix_time_limit: Option<f64>,
+) {
+    // Temporary vectors used to track things without needing a reference to the
+    // environment or to lock the object. Re-used each iteration for efficiency.
+    let mut timers_tmp = Vec::new();
+    let mut audio_queues_tmp = Vec::new();
+    let mut audio_units_tmp = Vec::new();
+
+    fn limit_sleep_time(current: &mut Option<Instant>, new: Option<Instant>) {
+        if let Some(new) = new {
+            *current = Some(current.map_or(new, |i| i.min(new)));
+        }
+    }
+
+    let is_main_run_loop = env.current_thread == 0;
+
+    if is_main_run_loop && !single_iteration {
+        // Diagnostic: everything the app's UI does — event delivery,
+        // composition, timers — is dispatched from this loop. If this line
+        // never appears in the log, the app hung before its run loop ever
+        // started (e.g. somewhere inside applicationDidFinishLaunching).
+        log_once!("Main run loop: now dispatching events, timers and composition");
+    }
+
+    loop {
+        let mut sleep_until = None;
+
+        // Commit implicit CATransactions
+        // From the CATransaction docs:
+        //  "Implicit transactions are created automatically when the layer
+        //  tree is modified by a thread without an active transaction and are
+        //  committed automatically when the thread’s runloop next iterates."
+        ca_transaction::State::commit_implicit_transaction(env);
+
+        // We want to process those only on the main run loop
+        if is_main_run_loop {
+            let next_due = uikit::handle_events(env);
+            limit_sleep_time(&mut sleep_until, next_due);
+
+            let force_video_composition = media_player::has_active_video(env);
+            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
+            limit_sleep_time(&mut sleep_until, next_due);
+        }
+
+        assert!(timers_tmp.is_empty());
+        timers_tmp.extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).timers);
+        // Retain the timers in case a timer cancels another timer
+        // (which releases it)
+        for timer in timers_tmp.iter() {
+            retain(env, *timer);
+        }
+
+        for timer in timers_tmp.drain(..) {
+            let next_due = ns_timer::handle_timer(env, timer);
+            // Timer deadlines are virtual; audio/UI deadlines remain real.
+            let host_due = next_due.map(|due| env.guest_clock.host_deadline(due));
+            limit_sleep_time(&mut sleep_until, host_due);
+            release(env, timer);
+        }
+
+        // TODO: We currently don't properly handle if an audio queue or audio
+        // unit gets deleted while inside another queue's handler. Fixing this
+        // would be best done by implementing a more general run loop source
+        // system that can handle invalidation.
+        assert!(audio_queues_tmp.is_empty());
+        audio_queues_tmp.extend_from_slice(
+            &env.objc
+                .borrow::<NSRunLoopHostObject>(run_loop)
+                .audio_queues,
+        );
+
+        for audio_queue in audio_queues_tmp.drain(..) {
+            handle_audio_queue(env, audio_queue);
+        }
+
+        // TODO: not clear if audio units should be processed in the run loop
+        assert!(audio_units_tmp.is_empty());
+        audio_units_tmp
+            .extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).audio_units);
+
+        for audio_unit in audio_units_tmp.drain(..) {
+            render_audio_unit(env, audio_unit);
+        }
+
+        // Process Audio Services completion callbacks. Apple's
+        // `AudioServicesAddSystemSoundCompletion` fires its registered
+        // routine on the run loop that owned it; touchHLE only models a
+        // single run loop, so we poll OpenAL source state once per tick
+        // and dispatch finished completions here.
+        tick_system_sound_completions(env);
+
+        if is_main_run_loop {
+            media_player::handle_players(env);
+        }
+
+        // Unfortunately, touchHLE has to poll for certain things repeatedly;
+        // it can't just wait until the next event appears.
+        //
+        // For optimal responsiveness we could poll as often as possible, but
+        // this results in 100% usage of a CPU core and excessive energy use.
+        // On the other hand, for optimal energy use we could always sleep until
+        // the next scheduled event (e.g. the next timer), but this would lead
+        // to late handling of unscheduled events (e.g. a finger movement) and
+        // events that are scheduled but we can't get the time for currently
+        // (audio queue buffer exhaustion).
+        //
+        // The compromise used here is that we will wait for a 60th of a second,
+        // or until the next scheduled event, whichever is sooner. iPhone OS
+        // apps can't do more than 60fps so this should be fine.
+        let limit = Duration::from_millis(1000 / 60);
+        env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
+
+        if single_iteration {
+            break;
+        }
+
+        // CFRunLoopStop sets this flag to break out of the loop.
+        if env.objc.borrow::<NSRunLoopHostObject>(run_loop).stopped {
+            env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).stopped = false;
+            break;
+        }
+
+        if let Some(limit) = unix_time_limit {
+            // We use Unix epoch as a convenience reference date.
+            // (Apple's epoch is less convenient in Rust. And "pure"
+            // Rust approach with Duration/Instant is just too troublesome
+            // and not worthy to convert back and forth)
+            // The host clock could be set before the Unix epoch (or skew
+            // backwards); never panic on that, just treat it as "not yet".
+            let now_secs = env.guest_clock.system_time()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            if now_secs >= limit {
+                break;
+            }
+        }
+    }
+}
+
+/// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods
+pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) -> id {
+    if env.threads[thread_id]
+        .thread_local_framework_state
+        .foundation
+        .ns_run_loop
+        .run_loop
+        == nil
+    {
+        let host_object = Box::new(NSRunLoopHostObject {
+            audio_units: Vec::new(),
+            audio_queues: Vec::new(),
+            timers: Vec::new(),
+            sources: Vec::new(),
+            ports: Vec::new(),
+            stopped: false,
+        });
+        // TODO: is it OK to allocate static object for all threads,
+        // not only main one?
+        let new = env
+            .objc
+            .alloc_static_object(this, host_object, &mut env.mem);
+        env.threads[thread_id]
+            .thread_local_framework_state
+            .foundation
+            .ns_run_loop
+            .run_loop = new;
+    }
+    env.threads[thread_id]
+        .thread_local_framework_state
+        .foundation
+        .ns_run_loop
+        .run_loop
+}

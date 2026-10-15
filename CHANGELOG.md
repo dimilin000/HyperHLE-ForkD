@@ -1,0 +1,444 @@
+# Changelog
+
+This will list notable changes from release to release, and credit the people who contributed them. This mainly covers changes that are visible to end users, so please look at the commit history if you want to know all the details.
+
+Names preceded by an @ are GitHub usernames.
+
+Lists of new working apps are a guideline, not a guarantee of support, and are not comprehensive. Credits for new working apps indicate someone who put a lot of effort into getting that particular app working, but compatibility is always a cumulative collaborative effort. The “Various small contributions” in the changelog often add up in a big way.
+
+Changes are categorised as follows:
+
+* Compatibility: changes that affect which apps work in touchHLE.
+* Quality and performance: changes that don't affect which apps work, but do affect the quality of the experience.
+* Usability: changes to features of the emulator unrelated to the above, e.g. new input methods.
+* Other: when none of the above seem to fit.
+
+## NEXT
+
+Quality and performance:
+
+- Startup and runtime no longer pay for per-call debug tracing on the hottest emulator paths. Several verbose traces had been left as unconditional output that ran on *every* occurrence: `-[NSString stringWithFormat:]` formatting, every UTF-16 conversion of an `NSString`, `-[NSMutableString mergeWithPrevious:]`, and the `objectAtIndexedSubscript:` NSArray-literal compatibility shim. On string/array-heavy apps this fired thousands of times before the first frame — on Doodle Jump roughly 85% of all log lines during launch came from these — and each line was a synchronous write to stderr plus the on-disk log, stalling the thread that runs the emulated CPU. They are now gated behind `log_dbg!` (off by default), so they stay available for debugging but cost nothing in normal use. Measured locally (release, software renderer) this cut Turbo Dismount's time-to-first-frame from ~9s to ~5s and shrank Doodle Jump's launch log from several thousand lines to a few hundred. (@j92580498-max)
+- The in-file log now writes each line with a single `write` syscall instead of two, which is cheaper on the slow storage mobile devices log to. (@j92580498-max)
+- The per-message-send selector probes are cheaper. The `objectAtIndexedSubscript:` interpose runs on every guest `objc_msgSend`, and previously read and UTF-8-validated the whole selector-name C string each time just to compare it against one fixed name. It now uses a zero-allocation byte comparison (`Mem::cstr_eq` / `SEL::name_eq`) that early-exits on the first mismatching byte — the usual outcome — avoiding the per-message string scan and validation. (@j92580498-max)
+
+Compatibility:
+
+- `dispatch_after` now runs its block asynchronously on a later run-loop turn instead of calling it inline. The old implementation invoked the block immediately (the source even noted "timer not supported"), which broke the very common pattern of a method re-arming itself with `dispatch_after` for a blink/poll/retry loop: the block re-entered its own method without bound, overflowing the native stack or — with the `objc_msgSend` recursion guard — bailing out with `nil` and corrupting state. Doodle Jump's `-[JumpAppDelegate blinkTournamentButton:]` is one such self-rescheduling animation; it recursed until the 128-deep guard tripped on every frame. The block (and the `dispatch_after_f` function pointer) is now heap-copied and fired from a one-shot `NSTimer` on the main run loop, mirroring the existing `+[UIView animateWithDuration:…completion:]` deferral. (@j92580498-max)
+- `-[UIImage imageNamed:]` now falls back to the `@2x`/`@3x` (and `~iphone`) asset variants when the plain-scale file is missing, and infers the image's scale from that suffix so `-[UIImage size]` reports points rather than pixels. Modern iPhone-only apps (iOS 7+) routinely ship *only* Retina assets — every device they support is Retina — so on touchHLE's 1x device almost all of their artwork (buttons, popups, HUD) previously failed to load and the UI appeared broken. The scale inference keeps those assets laying out and hit-testing at their intended size instead of double size. Doodle Jump's bundle, for example, ships 770 `@2x` PNGs and only ~20 plain ones. (@j92580498-max)
+- The Core Animation compositor no longer takes the fullscreen `CAEAGLLayer` fast path while that layer has never presented a frame. Apps that sit on a UIKit screen (menus, cross-promo/"prize" popups) with an idle fullscreen EAGL layer — Doodle Jump does this at launch — had their UIKit view tree skipped entirely, leaving the screen blank. Composition now runs until the app actually starts driving GL (`presentRenderbuffer` sets the presented pixels), at which point the fast path takes over again. (@j92580498-max)
+- `UIImageView` now disables user interaction by default, matching UIKit (plain `UIView` defaults to enabled, but `UIImageView` does not). Apps routinely stack a decorative image view on top of the real tappable control — or put one *inside* a `UIButton` — so with interaction left enabled the image view swallowed the touch and the control underneath was dead. This is what made Doodle Jump's menu buttons and its launch cross-promo close button unresponsive. (@j92580498-max)
+- UIKit touch routing no longer lets empty helper windows or fully transparent, content-less overlay views intercept touches meant for the content beneath them. Apps present launch popups (age gate, ATT prompt, cross-promo) in their own dedicated `UIWindow`s; when those flows are completed synchronously the now-empty window could stay key and on top, swallowing every touch, and some bundles also leave a bare full-screen `UIView` over the content. Hidden windows are skipped, windows whose view tree bottoms out in content-less root views are skipped, and when the standard `hitTest:` lands on an empty transparent overlay the search retries beneath it. (@j92580498-max)
+- The `AgeGateView` auto-complete workaround now tears down the dedicated `UIWindow` the app hosts the gate in. The app makes that window key before presenting the gate; because the gate is completed synchronously (never running the real present/dismiss cycle), the window was left key, visible and empty on top of the game window, blocking all input. It is now hidden after completion and key is handed back to the presenting window. Together with the touch-routing and `UIImageView` fixes above, this lets Doodle Jump dismiss its launch cross-promo and reach its interactive main menu. (@j92580498-max)
+- Doodle Jump's launch "what's new" cross-promo (`ImagePopUpView`) is now auto-dismissed. The app gates the rest of its startup (`continueInitializationAfterPopups`) behind this popup, whose close button only un-hides once its embedded `UIWebView` finishes loading remote content; with no web backend that never happens, so the popup could never be closed and initialization stalled. Mirroring the `AgeGateView` auto-complete, the first time the popup appears its removal and the initialization continuation are scheduled on the run loop so the game proceeds to its real main menu. (@j92580498-max)
+
+- `MPMoviePlayerController` keeps its legacy behavior for games that depend on eager preloading or automatic fullscreen presentation. The bundled defaults opt Grand Theft Auto III into `--fix-movie-player`, which adds hidden-until-first-frame rendering, surface clearing, and fullscreen sizing to fix its black movie-player panel.
+- EAGL's iPad 180-degree autorotation compensation keeps the legacy iPad/non-portrait heuristic for other apps. The bundled defaults also enable `--rotation-fix` for GTA III, so compensation follows the actual UIKit autorotation transform instead of assuming every iPad app rotated its root view.
+
+- `read(2)` and `write(2)` on a socket now work instead of failing with `write(9, …) encountered error Custom { kind: Unsupported, error: "write not supported on socket via GuestFile" }, returning -1`. A socket descriptor is represented by a placeholder `GuestFile::Socket` — the real host socket lives in `libc::sys::socket`, keyed by the descriptor — but the generic I/O entry points never dispatched to it, so every transfer that did not go through `send()`/`recv()` failed: `write()`, `fread()`/`fwrite()` on a `FILE*` wrapped around a socket, `NSFileHandle` and `writev()`. Minion Rush's online code is one of the apps that only uses plain file I/O on its sockets, so its network requests never left the device. `posix_io::{read, write}` now route socket descriptors to the new `sys::socket::{read_socket, write_socket}`, which reuse the existing `recv()`/`send()` implementations. A blocking descriptor (the default) waits for the peer by polling with `Environment::sleep()`, so the rest of the emulator keeps running, bounded at 30 seconds; a descriptor with `O_NONBLOCK` gets the `EAGAIN` that `recv()`/`send()` already produce, and a blocking `write()` may report a short count when the send buffer fills up (legal for `write(2)`, and the guest retries the rest). Related socket paths were fixed at the same time: `fflush()`/`fclose()` on a socket no longer fail (there is nothing buffered to flush), `ftruncate()` reports `EINVAL` instead of returning -1 with `errno` 0, and `fcntl(F_DUPFD)` now duplicates the host socket instead of failing on the placeholder, so a duplicated descriptor keeps working.
+- `AVPlayerItem` now tracks basic `CMTime` playback state and posts end-of-playback notifications for the existing no-decoder path. Goat Simulator's unavailable ReplayKit singleton is stubbed; this is partial framework support, not a claim that the game is playable.
+
+- The Mach-O linker no longer treats local, non-external symbols as exports to dependent binaries. Iron Man 2 contains a local `_log2` symbol that previously shadowed the imported math function, sending execution into constant data; the import now resolves to the host implementation.
+
+- Android: the host camera and microphone bridge is no longer silently unavailable. `android_media` resolved its JNI class and method IDs lazily, i.e. from guest code — and guest code runs on a coroutine stack, where ART cannot find the app class loader, so `FindClass("org/touchhle/android/HostMedia")` returned NULL and every probe (`+[UIImagePickerController isSourceTypeAvailable:…Camera]`, `isCameraDeviceAvailable:`, `availableMediaTypesForSourceType:`, `AVCaptureDevice`, `-[AVAudioSession inputIsAvailable]`, `AVAudioRecorder`, RemoteIO input) answered "this device has no camera / no microphone" without a single log line. The lookups now happen once at startup on the real SDL thread and are cached (global class reference + method IDs), exactly like the WebView bridge already did; calling the resolved methods from a coroutine stack is fine. Any failure now says why, `HostMedia` reports at startup what the device actually exposes (per-facing camera count, microphone feature, permission state) and logs every reason it returns "unavailable", and `hasCamera` falls back to the system camera feature flag when the Camera2 service throws instead of reporting "no camera". (@KlugKlugTG)
+
+- Android: asking whether a camera or a microphone exists no longer kills the emulator. `android_media`'s hand-rolled JNI walked the function table one dereference short — it indexed the `JNIEnv*` itself instead of the `struct JNINativeInterface_` that pointer leads to — so `FindClass` and everything after it called whatever bytes happen to follow the 8-byte `JNIEnv` struct in ART's per-thread heap. Those bytes are usually zero, so the first `+[UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeCamera]` (also `isCameraDeviceAvailable:`, `availableMediaTypesForSourceType:`, `availableCaptureModesForCameraDevice:`, `AVCaptureDevice`, and RemoteIO/`AVAudioRecorder` microphone input) ended the host process with `SIGSEGV at address 0x0` and nothing in the log but the FATAL SIGNAL marker: no panic, no loader error, no guest fault. The table walk now lives in a single shared helper (`src/android_jni.rs`) that both Android bridges use, so they cannot drift apart again; it is plain pointer arithmetic, so it is unit-tested on every platform rather than only in an Android build. An unresolved slot is now reported instead of called, and both bridges answer "no such hardware" in that case — the same answer they already give off Android. (@KlugKlugTG)
+
+- Android: mDNS/Bonjour LAN discovery is no longer silently dead. `MainActivity` acquires a Wi-Fi multicast lock in `onCreate()` because Android Wi-Fi drivers drop multicast unless an app holds one, but the manifest never declared `android.permission.CHANGE_WIFI_MULTICAST_STATE`, so every launch threw a `SecurityException` (visible as "Couldn't acquire Wi-Fi multicast lock" in logcat) and the lock was never held. GameKit/`NSNetService` LAN server discovery therefore found nothing. It is a normal install-time permission, so nothing new is prompted for. (@KlugKlugTG)
+
+- `MPMoviePlayerController` now demuxes MP4 metadata with Symphonia and decodes H.264 video in-process with bundled OpenH264, so supported movies no longer depend on host-installed `ffmpeg` or `ffprobe`. It reports the track's natural size and duration, presents decoded frames through the existing Core Animation path, and routes the movie soundtrack through the existing `AVAudioPlayer` implementation.
+- Fixed-function OpenGL ES point-size and point-attenuation calls no longer abort when legacy game code makes them on an ES 2.0/3.0 shader context. These unsupported setters are ignored on shader-only backends while ES 1.1 backends retain their existing implementations; this lets BackStab create its first movie and reach the title screen instead of aborting during startup.
+
+- The main thread's stack is no longer flush against the top of the 32-bit address space, fixing the Asphalt 8 Tokyo drift event that froze at one drift point. touchHLE put the 1MiB main stack at 0xfff00000-0xffffffff with the initial SP at 0x100000000, so a stack object anywhere near the top of the stack ran off the end of the address space and wrapped around to zero. Asphalt 8's drift event copies a struct into a buffer at 0xffffffc8 (`str r0, [r5, #0x20]` followed by a chain of `ldr r4, [r0, #n]` / `str r4, [r5, #0x20+n]`): the first 24 bytes land at 0xffffffe8-0xfffffffc and the rest of the stores wrap to 0x0-0xfc, which is indistinguishable from the guest storing through a NULL pointer, and silently corrupts whatever lives at the bottom of the address space. A 1MiB guard region is now reserved above the stack, so the usable stack ends at 0xffefffff, the initial SP is 0xfff00000, and near-top stack objects overflow into mapped guard memory instead of wrapping. iPhone OS never puts the stack flush against the top of the address space. (@KlugKlugTG)
+
+- The guest-trap bypass can no longer livelock a thread forever. When the same (PC, LR) pair had trapped 256 times the emulator skipped the faulting instruction *and* cleared the same-LR runaway counter, so that counter restarted from zero every time and the documented `LR_BYPASS_LIMIT` bound could never be reached. Asphalt 8's drift event spun that way at PC 0x2a00c / LR 0x29fe1, logging "looped 256 times" hundreds of times over while the race hung. The counter is now left alone by that path, so it reaches its bound; genuine forward progress still clears it on every successful host-function dispatch. (@KlugKlugTG)
+
+- Null-page reads and writes now share a single backing page. Writes used to be discarded into a separate write-sink page while reads came from a zero-filled stub page, so anything stored through nil and read back came out as zero; offsets that are never written still read as zero, so `*(void**)0` remains NULL. The nil-access log budget is also split between reads and writes: one shared 64-site budget let a burst of writes permanently silence the nil reads that follow. (The 64 four-byte stores at 0x0-0xfc during the Asphalt 8 drift event, which this was originally blamed for, turned out to be an address-space wraparound rather than a NULL base pointer — see the entry above.) (@KlugKlugTG)
+
+- Guest trap recovery (the `Ignored UndefinedInstruction at … Faking function return to LR` path) is now frame-aware, fixing the Asphalt 8 startup loop where the same `UndefinedInstruction at 0x1e432 … LR (0x1e3c7)` was bypassed 256 times in a row. The emulator now gets the exact faulting address from dynarmic (the old rewind landed in the middle of 32-bit Thumb-2 instructions), tells deliberate `udf`/`trap`/`bkpt` instructions apart from instructions dynarmic merely cannot decode (those are stepped over as no-ops instead of abandoning the function), and for deliberate traps pops the validated `{r7, lr}` frame record — restoring SP and r7 and returning 0 to the real caller — whenever LR is stale (the call that produced it already returned, so "returning" to it just re-ran the same code into the same trap), whenever the trapping function owns the frame record, or once branching to LR has demonstrably failed to make progress for the same (PC, LR) pair. Execution that has slipped into the second halfword of a `bl` (Asphalt 8's `0xfbea3c59` at 0x196cc during one race's countdown) is recognised as misaligned and recovered the same way instead of being "skipped" into garbage, and every first trap at a site now logs a code dump, the linked function the preceding call went to, and a stack trace. (@KlugKlugTG)
+
+- Undecodable instructions inside a code section are no longer assumed to be real code, fixing the Asphalt 8 log flood where the PC — thrown into a blob of data inside `__text` by an indirect call at 0x1e3c2 (LR 0x1e3c7) — was walked through that blob one 4-byte encoding at a time (0x1dd34, 0x1dd40, 0x1dd48, 0x1dd4c, 0x1dd50, 0x1e1ec, 0x1e1f0, …), printing a warning, a hex dump and a stack trace for every new site and never recovering. Stepping over an undecodable encoding is only correct when the bytes really are an instruction dynarmic lacks, and dynarmic implements essentially all of ARMv7-A including VFP and NEON, so an `UndefinedInstruction` in a code section almost always means the PC has left the instruction stream — a literal pool, switch table or other data. `classify_guest_trap` now applies a structural test (compiled Thumb-2 interleaves 16-bit and 32-bit instructions constantly, so four or more consecutive 32-bit encodings covering the fault is data, not code) and reports those sites as `ExecutionInData`, which is recovered like a wild PC — fake return to LR, escalating to popping the validated `{r7, lr}` frame record — instead of being skipped. The no-op path keeps working for genuine unimplemented instructions, with two new bounds: only the first 8 distinct sites get the full dump and stack trace, and after 128 distinct sites the emulator stops skipping and recovers the call instead, so a misclassification can neither flood the log nor walk the guest through a blob indefinitely. (@KlugKlugTG)
+
+- Guest DNS resolution and TCP/UDP socket handling now support IPv6 results and `AF_INET6` addresses, including IPv4-mapped IPv6 addresses.
+- Geometry Dash 2.11 music now plays even when the game's FMOD streamer still outputs silence on the emulated `AURemoteIO` unit: `fopen()` on known menu/level track names (e.g. `menuLoop.mp3`, `Stereo Madness.mp3`) hands the file to a new host-side music bypass (`src/audio/music_bypass.rs`, opt in with `--fix-music` or `TOUCHHLE_GD_MUSIC_BYPASS=1`) which decodes the same MP3 with Symphonia and plays it through a dedicated host OpenAL device on its own thread. The bypass keeps one track playing at a time (re-opens of the current track are ignored instead of layering a second copy, a new track replaces the old one), pauses when the guest stops reading the stream for two seconds (pause menu), resumes when reads pick back up, restarts from the top when the guest rewinds the stream (death/respawn), and stops when the guest closes the file (refcounted, since FMOD opens overlapping `FILE*`s for one track). Diagnostics that pin down the remaining FMOD-side silence (ring-buffer index sampling, render-callback peak meters, thread/semaphore switch tracing, and an optional `TOUCHHLE_GD_AUTOPLAY` scripted tap injector for reaching a level) are also included. (@KlugKlugTG)- Android soft-keyboard requests from UIKit responders now reach the host IME after the editor view is attached; private `UIKeyboard` activation is bridged to SDL text input, and repeated focus requests retry the keyboard.
+- `UISearchBar` now participates in first-responder handling and routes text, backspace, and Search-key events to its delegate.
+- Cocos2d's `EAGLView` `UIKeyInput` responder now opens the host keyboard and receives text, delete, and Return events through the guest's IME dispatcher.
+
+- Gangstar Rio now reports `UIScreen.bounds`, `nativeBounds`, and `currentMode.size` in landscape when launched in landscape, keeping its EAGL scene from rendering in a small clipped region on iPhone 5/5c.
+
+- ObjectAL-based games (e.g. Superman HD) now find their bundled sound effects: when every strict `NSBundle pathForResource:` lookup misses, a case-insensitive scan of the whole bundle is tried as a last resort, so `+[OALTools urlForPath:]` no longer reports "Could not find full path of file …" for effects stored in bundle subdirectories and `OALSimpleAudio` preloads them instead of spamming OAL errors. Separately, `class_getClassMethod` now returns a proper opaque `Method` handle (matching `class_getInstanceMethod`) instead of the raw class pointer; guests feed that handle to `method_getImplementation`/`method_setImplementation`, so class-method swizzling now actually takes effect — ObjectAL's `SynthesizeSingleton` macro replaces `+sharedInstance` that way, and previously the silently-failed swizzle flooded the log with "method did not get swizzled" NSAssert warnings on every call. (@KlugKlugTG)
+
+- ObjectAL music playback (Superman HD's "Could not load URL …/music2.mp3: (null)") is fixed twice over: `-[AVAudioPlayer initWithContentsOfURL:error:]` and `initWithData:error:` now clear `*outError` on success, so callers that declare `NSError* error;` uninitialised (as old ObjectAL's `OALAudioTrack preloadUrl:seekTime:` does, testing `nil != error`) can no longer mistake stack garbage for a load failure of a file that actually opened fine; and `AudioFile::open_for_reading` falls back to the new `Fs::resolve_lenient_path` — a bounded case-insensitive basename scan under the deepest existing ancestor directory — so hardcoded `<bundle>/file` paths still resolve when the asset ships in a bundle subdirectory. (@KlugKlugTG)
+
+- Geometry Dash 2.11's music was completely silent (menu and levels alike) while its death/click sound effects played fine, which points at the *streaming* half of the audio engine rather than at the output device: GD uses FMOD Ex, which decodes one-shot samples up front but streams long music tracks on a worker thread. Two emulator bugs in that path are now fixed. First, Mach's `semaphore_timedwait()` was missing entirely, so the dynamic linker bound it to the generic return-0 stub, which reports `KERN_SUCCESS` *without blocking and without consuming a semaphore unit* — a worker thread paced by such a wait is told "your event fired" on every single call and never synchronises with the ring buffer it is supposed to fill. Second, every `AURenderCallback` the emulator's audio pump invokes was handed `NULL` for `inTimeStamp`, leaving a mixer that paces itself against the audio clock with no sample/host time to sync its stream buffer to. (@KlugKlugTG)
+
+- `vm_deallocate()` now accepts any sub-range of a region handed out by `vm_allocate()`/`vm_remap()`, matching the Mach kernel: apps that carve one mapping into several buffers and release them one at a time previously got `KERN_INVALID_ADDRESS` for every release that did not start exactly at the region base, and the region was then freed wholesale by whichever call happened to match the base. Released sub-ranges are tracked and coalesced, the host allocation is returned once the whole region has been released, and every successful release reports `KERN_SUCCESS`. Geometry Dash's FMOD initialisation does exactly this four times at startup (a 0x3e000-byte region released as two 0x1f000 halves), so those calls no longer report failure to the audio engine. (@KlugKlugTG)
+
+- Geometry Dash now also gets the "zero memory on alloc instead of free" treatment already used for Spore Origins and Critter Crunch. GD loads each streamed track into a memory buffer, hands that buffer to FMOD and frees it as soon as `createStream()` has returned — FMOD's `FMOD_OPENMEMORY_POINT` streams keep decoding straight out of it for the lifetime of the sound. On a real device the freed bytes survive until the chunk happens to be reused, so this goes unnoticed; the emulator's default scrub-on-`free()` wiped the song the instant it was freed, leaving FMOD's streamer to decode zeroes (and GD to reload the track over and over), while one-shot samples — decoded before the buffer is freed — kept playing. That is precisely the reported symptom: sound effects audible, music never. (@KlugKlugTG)
+
+- Geometry Dash's silent music turned out to have a third and decisive cause: the emulator's Symphonia build was missing the standalone metadata readers. `default-features = false` drops upstream's `all-meta`, so `Id3v2Reader` was never registered with the default `Probe` (its registration is behind `#[cfg(feature = "id3v2")]`). An ID3v2-tagged MP3 — which is what Newgrounds tracks like `Fingerdash.mp3` are, their first bytes being `49 44 33 03`, i.e. "ID3" plus version 2.3 — then has to be located by a byte-by-byte scan of the raw tag searching for an MPEG frame sync, capped at 1 MiB by `ProbeOptions::max_probe_depth` and free-matching inside embedded cover art. `Probe::probe()` returns the first format reader's error without retrying any other candidate, and in Symphonia 0.6.0 `Probe::next()` ignores its `Hint` argument entirely, so this could not be worked around at the call site. Decoding therefore failed, and `AudioFileOpenWithCallbacks()` — which is how FMOD Ex hands GD's decrypted song files to Audio File Services, pulling the whole track through the guest's own read/size callbacks in 64 KiB blocks — reported `kAudioFileSuccess` and substituted a dummy `AudioFile` claiming two seconds of 44.1 kHz stereo while serving all-zero PCM. The guest thus saw a perfectly valid, perfectly silent song. The `.ogg` effects were unaffected because Audio File Services has no Ogg Vorbis support at all, so FMOD decodes those with its own codec and never enters this path. Symphonia's `ape`, `id3v1` and `id3v2` features are now enabled; they are plain cfg flags inside the already-compiled `symphonia-metadata`, so this adds no crates and leaves `Cargo.lock` untouched. In addition, `AudioFileOpenWithCallbacks()` now returns `kAudioFileUnsupportedFileTypeError` with a `NULL` handle when the delivered data cannot be decoded, matching Audio File Services, rather than a silent dummy that hides the failure and prevents the guest from falling back to its own decoder; `TOUCHHLE_AUDIOFILE_DUMMY_ON_ERROR=1` restores the previous behaviour. (@KlugKlugTG)
+
+- Gangstar Rio's shader programs that declare the same uniform array with different element counts in the vertex and fragment shaders (e.g. `light`, rejected by strict linkers with "Field numbers of uniform 'light' differ between VERTEX and FRAGMENT shaders") now link: before linking, both stages are rewritten to the maximum declared size, mirroring the lenient PowerVR drivers of real devices. `_msync` is implemented as a succeeding no-op instead of a return-0 stub warning. (@KlugKlugTG)
+
+- Android: the app picker's quick options now have a "GLES Native" switch (OFF by default) replacing the old "Verbose GLES" one: OFF uses the bundled ANGLE libraries, ON uses the vendor's native OpenGL ES driver (Adreno/Mali) instead (`--no-gles-native` / `--gles-native` on the command line). ANGLE's stricter GLSL ES validation broke some apps' shaders — most visibly Gangstar Vegas rendering as magenta garbage — because its programs link fragment shaders that declare varyings the vertex shader never declares, and ship `#extension` directives after code. Independently of the driver choice, guest shader sources now get their `#extension` directives hoisted above all code before compiling, and before `glLinkProgram` any fragment-only varyings are re-declared in the vertex shader, so strict linkers (ANGLE et al.) accept programs that real iPhone-era PowerVR drivers tolerated. (@KlugKlugTG)
+
+- `realpath()` no longer aborts the guest when the app passes `NULL` as the resolved-path buffer (a valid POSIX usage that mallocs the result); it now allocates the buffer instead. It also sets `errno`/returns `NULL` on unreadable paths instead of failing the whole call. `dirname(3)` is now implemented, along with `getpwuid_r(3)` (a single stub `root`/`mobile` user with the app-container home directory) and `sysconf(_SC_GETPW_R_SIZE_MAX)`. Together these fix Unity's startup path (`rvmStartup` → `getenv("HOME")` fallback chain) for Unity games such as Deep Town. (@KlugKlugTG)
+
+- Plants vs. Zombies 2 now uses an iPhone 4 profile because its bundle requires a front-facing camera; this change reaches the title/loading screen, but menu/gameplay support remains incomplete. (@j92580498-max)
+
+- New working apps:
+  - Devil May Cry 4 Refrain (@hikari-no-yume)
+  - Amerzone Pt1 (@ciciplusplus)
+  - Eternal Legacy (@ciciplusplus)
+  - Dungeon Hunter 2 (@ciciplusplus)
+  - N.O.V.A. 2: The Hero Rises Again (@ciciplusplus)
+  - Star Battalion (@ciciplusplus)
+  - Ice Age: Dawn of the Dinosaurs (@ciciplusplus)
+  - Zombieville (@ciciplusplus)
+  - Doom Resurrection (@ciciplusplus)
+  - Ace Combat Xi (@alborrajo)
+  - Fruit Ninja (@acieslewicz, @ciciplusplus)
+  - Asphalt 6 (@ciciplusplus)
+  - World of Goo (@ciciplusplus)
+- API support improvements:
+  - Unimplemented GLES calls now log the entry point and active guest GLES profile once; unresolved `gl*` symbols get an explicit GLES diagnostic. Existing fallback behavior is unchanged.
+  - Apple's libm `__exp10` alias is now exported as Mach-O symbol `___exp10` and computes `10^x`, preventing calls from falling through to dyld's return-zero stub.
+  - On hosts without native PVRTC support, full-level `glCompressedTexSubImage2D` updates now reuse the software-decoded RGBA texture instead of issuing an unsupported compressed update. (@j92580498-max)
+  - `-[NSObject performSelectorOnMainThread:withObject:waitUntilDone:]` now queues `waitUntilDone:NO` calls made on the main thread for the next run-loop pass instead of invoking them inline. This prevents asynchronous startup callbacks from observing partially initialized state and fixes Battleship FREE's age/terms flow stalling before its first rendered frame.
+  - `NSBundle` now retains cached bundle instances, and `UINib` honors the bundle argument instead of asserting that every nib comes from the main app bundle. This allows Battleship FREE to load its nested age-verification nib and localized strings.
+  - Bundled Mach-O dependencies are loaded transitively, and the guest ARM SJLJ unwinder is preferred when present instead of being replaced by host stubs; this lets C++ exceptions unwind normally during game startup.
+  - `CFURLCreateStringByReplacingPercentEscapesUsingEncoding()` is now implemented per Apple's documentation instead of returning the input string unchanged: every `%XX` escape is decoded using the specified encoding, characters named in `charactersToLeaveEscaped` keep their escape sequences, invalid or incomplete escape sequences return `NULL`, and passing an empty string removes all escapes. Previously apps that used it to unescape URLs got escaped strings back.
+  - `AudioFileGetGlobalInfoSize()` and `AudioFileGetGlobalInfo()` now answer the documented global info properties `kAudioFileGlobalInfo_ReadableTypes`, `kAudioFileGlobalInfo_WritableTypes` and `kAudioFileGlobalInfo_AvailableFormatIDs` (with the documented file-type specifier) instead of returning `kAudioFileUnsupportedPropertyError`, and follow the documented buffer-size protocol (`kAudioFileBadPropertySizeError` for undersized buffers) otherwise.
+  - `-[UIViewController dismissMoviePlayerViewControllerAnimated]` now dismisses the presented movie player view controller with the standard transition (previously a no-op stub), so apps that show a full-screen movie on launch can be closed again.
+  - `NSBlockOperation` is now implemented per Apple's documentation: `+blockOperationWithBlock:`, `-addExecutionBlock:`, `-executionBlocks` and `-main` (blocks run in the order they were added), and `-[NSOperationQueue addOperationWithBlock:]` uses it instead of logging a warning and doing nothing. Apps that queue work as blocks now execute it.
+  - `-[UIScreen brightness]` / `-setBrightness:` and `-wantsSoftwareDimming` / `-setWantsSoftwareDimming:` are now implemented per Apple's documentation: the setter clamps brightness to the documented 0.0–1.0 range and both properties are stored and returned by their getters (previously stubs that logged and discarded the value).
+  - `AudioFileOptimize()` now validates the audio file handle and returns `kAudioFileSuccess` for open files (`kAudioFileNotOpenError` otherwise), matching the documented behavior that optimization is a hint which never fails for a valid file (previously always returned `kAudioFileOperationNotSupportedError`).
+  - `-[NSProcessInfo operatingSystemVersionString]` now reports the same version as `-operatingSystemVersion` (previously a second, stale declaration returned a fixed iOS 3.1.3 string, which also made the duplicate-selector self-test fail).
+  - Removed duplicate `UIView` `layoutIfNeeded`/`setNeedsLayout` declarations so the dylib export self-tests pass again; the real implementations (which call `layoutSubviews`) are used.
+  - Mach semaphore timed waits are now implemented: `semaphore_timedwait()`, `semaphore_trywait()`, `semaphore_signal_all()`, `semaphore_signal_thread()`, `semaphore_wait_signal()` and `semaphore_timedwait_signal()` were all previously unimplemented return-0 stubs. Timed waits block against the guest clock (so game-speed changes apply to them) and return `KERN_OPERATION_TIMED_OUT` when the deadline passes; `semaphore_signal_all()` releases one unit per waiter instead of only one, and an invalid semaphore port now yields `KERN_INVALID_ARGUMENT` rather than a fake success. `mach_timespec_t` is received as two scalar parameters, matching AAPCS32's register pair for that 8-byte struct.
+  - The audio pump now passes a populated `AudioTimeStamp` to the `AURenderCallback`s it invokes (unit-level and per-mixer-bus) instead of `NULL`: `mSampleTime` advances by the number of frames rendered on each pass and is remembered per audio unit/bus, `mHostTime` comes from the same clock `mach_absolute_time()` reports, and `mRateScalar` plus the `kAudioTimeStampSampleTimeValid`/`HostTimeValid`/`RateScalarValid` flags are set.
+  - Various small contributions. (@hikari-no-yume, @ciciplusplus, @zazatree, @abnormalmaps, @alborrajo, @acieslewicz)
+  - Implemented the Objective-C runtime functions `property_getName()` and `property_getAttributes()` (previously return-0 stubs), and the `-[NSObject dictionaryWithValuesForKeys:]` Key-Value Coding method. This fixes apps whose embedded SDKs use runtime property introspection to serialize objects (e.g. Spy Mouse HD's Burstly ad SDK, which was stuck in a network/loading loop).
+  - `class_getProperty()` no longer special-cases `[UIScreen scale]` to return `NULL`. Now that declared `@property` metadata is parsed from the app binary, the function walks the class hierarchy and returns the real `objc_property_t`, matching Apple's documented behaviour. The old hard-coded `NULL` could make apps that probe for the `scale` property mis-detect the device's screen capabilities.
+  - `-[UIViewController presentModalViewController:animated:]` now falls back to the first visible `UIWindow` when neither the presenting controller's view nor the application's key window can supply one. Previously a modal presentation by a controller that wasn't yet attached to a window (e.g. the full-screen movie player some games show on launch) silently did nothing.
+  - Removed duplicate Mach `thread_suspend()`/`thread_resume()` and `wcstoul()` symbol exports. Two dylib export tables each registered these functions, so the dynamic linker bound the first (less robust) copy and the `no_duplicate_functions` self-test panicked; the canonical bounds-checked implementations in `mach::thread_info` and `libc::wchar` are now the only ones exported.
+  - C++ Itanium ABI type_info objects and `__cxxabiv1` type_info vtables are now resolved when they are referenced through the `__nl_symbol_ptr` table, not only through external relocations. Previously a symbol like `__ZTIPKc` (typeinfo for `char const*`), which the bundled libstdc++/libc++ of some iOS 8 apps emits into the non-lazy pointer table, was left NULL and caused a NULL-page crash the first time the app's C++ code touched RTTI. This fixes apps such as [Team Umizoomi Math Racer](https://github.com/HyperHLE/HyperHLE/issues/204).
+  - Several changes have been made to fix certain apps and games that should appear in landscape, but previously were displayed stretched, cropped and/or un-rotated:
+    - If an app requires a landscape orientation in the `UIInterfaceOrientation` or `UISupportedInterfaceOrientations` keys of its `Info.plist`, touchHLE will now rotate the virtual device at startup. (@hikari-no-yume)
+    - If an app overrides the `shouldAutorotateToInterfaceOrientation:` method in a `UIViewController`, and the virtual device is in a landscape orientation, touchHLE will now apply a rotation transform to the root view when it is added to a window. (@hikari-no-yume)
+    - Fixed a very old assumption that the backing store of a `CAEAGLLayer` should always be 320×480 pixels. (@hikari-no-yume)
+  - Support for iPad device family. Device family is deduced from the app bundle, but user can also override it with `--device-family=` option. (@ciciplusplus)
+  - Implicit Core Animation animations: changing an animatable `CALayer` property (`bounds`, `position`, `anchorPoint`, `opacity`, `hidden`, `backgroundColor`, `cornerRadius`) outside an explicit transaction now creates a default `CABasicAnimation` via the current `CATransaction`, while `UIView` backing layers keep implicit animations disabled so existing `UIView` animation handling is unaffected. (ported from touchHLE)
+  - Objective-C `+load` methods are now sent during class initialization, before any `+initialize`, matching the runtime's ordering guarantee. (ported from touchHLE)
+  - `NSGarbageCollector` (with `+defaultCollector` returning `nil`, as on iOS), `NSBundle` localized `.strings` loading in the standard (non-property-list) format, and `+[NSObject willChangeValueForKey:]`/`didChangeValueForKey:` integration. (ported from touchHLE)
+  - `dictionaryWithObjectsAndKeys:`/`initWithObjectsAndKeys:` now match Apple's documented vararg contract: the list is `(object1, key1, ...)`, terminated by a `nil` *object*, so a `nil` first object returns an empty dictionary without reading further varargs, and a `nil` *key* now skips just that pair and keeps parsing the rest (previously the whole dictionary was abandoned, losing every valid pair after it). Combined with the existing `-[NSMutableDictionary setObject:forKey:]` nil-key guard, apps whose ad/SDK layers build metadata conditionally (e.g. skipping absent keys) no longer lose data or abort on startup.
+  - The bundled dynamic libraries, libgcc and libstdc++, have been updated to their iOS 4.0.1 versions. (@ciciplusplus)
+  - Support for NIBArchive NIB file format decoding. (@ciciplusplus)
+  - `raise()` and the signal dispositions installed with `signal()`/`sigaction()` are now honoured. `raise()` no longer hits the dynamic linker's return-0 stub: when a handler is installed it is called synchronously on the calling guest thread, `SIG_IGN` is ignored as documented, and a fatal default action ends the guest session through the same controlled recovery path as `abort()` (which now raises `SIGABRT` first, so crash reporters and Unity's unhandled-exception shim run). `pthread_kill()` delivers to the calling thread through the same machinery (previously a silent return-0 stub) and reports `ESRCH` for unknown thread handles, and the `sys_siglist` signal-name table is exported.
+  - New `WatchConnectivity.framework` implementation: `WCSession` (with `+isSupported`, `+defaultSession`, delegate/activation-state handling, `sendMessage:replyHandler:errorHandler:` and the transfer APIs), `WCSessionUserInfoTransfer`, `WCSessionFile` and `WCSessionFileTransfer` exist as real classes, and `WCErrorDomain` is exported. Since there is no paired Apple Watch, the session behaves like one on an iPhone without a watch: activation succeeds, `isPaired`/`isWatchAppInstalled`/`isReachable` are `NO`, and send/transfer APIs report the documented `WCErrorDomain` errors instead of silently pretending to succeed. Previously every app that probed `[WCSession isSupported]` was told the class was unimplemented.
+  - `-[NSBundle localizedInfoDictionary]` now returns the bundle's localized information-property-list, i.e. the `InfoPlist.strings` of the preferred localization (`en.lproj`, `English.lproj` or `Base.lproj` fallbacks as with other resources) layered over the plain `Info.plist` contents, instead of returning `infoDictionary` unchanged. Previously `CFBundleGetLocalInfoDictionary()` and apps that read keys such as `CFBundleDisplayName` from this dictionary saw untranslated values.
+- Switch to coroutine based threading system. This solved [some compatibility issues](https://github.com/touchHLE/touchHLE/issues/119) and improved performance in some games. (@abnormalmaps)
+
+Quality and performance:
+
+- The EAGL/Core Animation presentation path avoids recurring HLE allocations and a redundant GL-context lookup: it snapshots only three options, resolves drawable bindings directly, scans fullscreen/window hierarchies by index, and skips the compositor window snapshot on frames that take the direct EAGL path. (@j92580498-max)
+
+- The AudioUnit output renderer now honours the guest's sample rate and interleaves both channel buffers for legacy stereo PCM formats that report a per-channel frame width. Resident Evil 4's 11,025 Hz stereo stream was previously rendered at the hardware rate and decoded from only one buffer, causing pitch and channel corruption. (@j92580498-max)
+
+- Native crash reports now name the instruction that actually died. `backtrace()` on bionic cannot unwind past the signal frame, so every frame a FATAL SIGNAL report printed belonged to the crash handler itself (libc, the handler, libsigchain, the vdso trampoline) — accurate, but it identified nothing. The handler now also reads the interrupted thread's PC/LR/SP from the `ucontext_t` the kernel hands a `SA_SIGINFO` handler, calls out the case where PC is 0 ("control was transferred through a NULL function pointer — not a data access"), and feeds both addresses into the existing `/proc/self/maps` attribution so they can be symbolized against the reported `libtouchHLE.so` load base. (@KlugKlugTG)
+
+- Debug builds now use an optimized Dynarmic CPU backend while retaining Rust debug assertions and the wrapper's memory-access abort checks; release builds are unchanged. This reduces guest CPU initialization time during game launches. (@j92580498-max)
+- Large PVRTC textures are now decompressed in parallel (up to four workers) on hosts without native PVRTC support, reducing game texture-load time without retaining decoded textures. (@j92580498-max)
+- The main emulation loop now skips trainer setup and app-ID allocation when the optional trainer is disabled; enabled-trainer behavior is unchanged. (@j92580498-max)
+- Fullscreen `CAEAGLLayer` detection now evaluates nested layer geometry in screen space and accepts a single exact UIKit device-orientation rotation when the transformed layer still covers the screen. Landscape games that use UIKit autorotation were incorrectly sent through `glReadPixels()` plus software Core Animation composition even on GPU-present configurations; they can now use the existing GPU presenter. The existing native ES 1.1 `auto` readback policy and explicit readback mode are unchanged, and arbitrary transforms/non-fullscreen layers still use the safe compositor path.
+- Major GLES presentation and draw-call overhead optimisation pass, plus stability fixes for everything that puts the picture on screen:
+  - Frames rendered into a fullscreen `CAEAGLLayer` are now presented on the GPU on every backend (the renderbuffer is copied into a texture and drawn into the window). Previously, on every native OpenGL ES 1.1 backend — i.e. for every ES 1.1 game on Android, including the bundled ANGLE driver — each frame was instead pulled back to system RAM with `glReadPixels()` (a full GPU pipeline stall), re-uploaded as a texture and pushed through the Core Animation compositor. That round trip was by far the largest per-frame cost on Android. The readback route is still available as `--present-mode=readback` (or `TOUCHHLE_PRESENT_MODE=readback`) for broken vendor drivers, and the default `--present-mode=auto` verifies the GPU route during the first seconds of a session by sampling a few pixels of the source and of the window: if the window stays black while the app's frame has content, it switches to readback automatically and says so in the log.
+  - The presenters no longer issue a `glFinish()` on every frame before copying the renderbuffer; the copy is ordered after the app's draws by the driver anyway, and the forced pipeline drain prevented the GPU from working on one frame while the emulator prepared the next. `--present-finish` (or `TOUCHHLE_PRESENT_FINISH=1`) brings the old behaviour back for drivers that need it.
+  - The presented window always has an opaque alpha channel now (the ES 2.0 present shader writes alpha 1.0, the ES 1.1 path masks alpha writes), so an app that leaves alpha < 1 in its renderbuffer can no longer come out darkened or see-through on window surfaces whose alpha the OS compositor honours (Android).
+  - `gl*Pointer`, `glVertexAttribPointer`, `glDrawArrays` and `glDrawElements` no longer ask the host driver about the buffer bindings and the fog state on every call (each such query came with a `glGetError()` round-trip to swallow the errors strict drivers raise for it — up to nine extra driver calls per draw). That state is now mirrored per context as the guest sets it, and generic-vertex-attribute guards are skipped entirely for the fixed-function apps that never enable such attributes.
+  - The ES 1.1 present path probes which capability enums the driver rejects once per context instead of wrapping every capability save/restore of every frame in error-drain loops (~100 fewer GL calls per presented frame), and the ES 2.0 presenter only clears the colour buffer of the (depth/stencil-less) window.
+  - The compositor updates layer textures in place with `glTexSubImage2D` when their size hasn't changed (instead of reallocating them with `glTexImage2D`), no longer clones a `CAEAGLLayer`'s full frame of pixels when building its presentation layer, and the readback presenter recycles its pixel buffer instead of allocating a fresh one every frame.
+  - Stability: `renderbufferStorage:fromDrawable:` clamps absurd renderbuffer sizes instead of panicking on the `GLsizei` conversion, error-queue drains in the presenter are bounded so a sticky driver error can't hang the emulator, and the per-thread current-context lookup on every GL call is a single hash lookup instead of two.
+- Android frame-rate pass for OpenGL ES 2.0 games (e.g. N.O.V.A. 3, Asphalt), which typically missed the display refresh rate on this fork:
+  - Android now uses bundled ANGLE for every app when its libraries are loadable; executable GLES imports and GPU detection no longer switch apps to the vendor's native driver. The `--gl-driver` / `TOUCHHLE_GL_DRIVER` selector was removed. If bundled ANGLE is unavailable, SDL falls back to the system driver.
+  - Vsync is now off by default on Android (`--vsync=auto`). HyperHLE paces frames itself and the Android compositor is synchronised to the display anyway, so a blocking `eglSwapBuffers` could not prevent tearing — it could only stall the emulator thread, and a frame that took slightly longer than one refresh then cost two (60 FPS → 30 FPS). `--vsync=on|off` (or `TOUCHHLE_VSYNC`) sets it explicitly on every platform; desktop defaults are unchanged.
+  - The emulator thread now runs at Android's "display" scheduling priority and reports its per-frame CPU time to the system performance hint manager (ADPF, Android 13+), so the CPU governor keeps the core clocked for the emulated workload rather than for the idle time between frames — the usual reason an emulated game that could run at 60 FPS settles at 30 after a few seconds. `--no-perf-hints` (or `TOUCHHLE_PERF_HINTS=0`) turns both off.
+- `CMDeviceMotion`/`CMAttitude` now expose the filter's continuous, full-3D quaternion (with pitch/roll/yaw decomposed from it) instead of a quaternion rebuilt from two gravity angles with a forced zero yaw. The two-angle construction had seams exactly in the poses people game in; near a seam a tiny physical twist produced an enormous frame-to-frame attitude delta and camera code consuming the attitude spun the view to maximum. `attitude`/`quaternion`/`rotationMatrix` are now always mutually consistent. (@KlugKlugTG)
+- The device-motion attitude filter now also learns the gyroscope's constant bias while the device is provably stationary (judging by accelerometer stability rather than by the gyro reading itself, so even a large constant offset converges), and its gravity input is low-passed first — together this removes both the bias-driven attitude wander and the resting-hand jitter seen in tilt-camera games. Diagnostic: setting `TOUCHHLE_NO_MOTION_GYRO` disables gyro integration entirely (for hosts with a genuinely unusable gyroscope signal).
+- `CMAttitude` now implements `rotationMatrix` and `multiplyByInverseOfAttitude:` — the standard way games calibrate a neutral pose for tilt-driven 3D cameras (store a reference attitude, then read camera-relative attitude). Previously these were unimplemented, so games fell back to the absolute world-frame attitude — which legitimately sits near its extremes in the upright gaming hold — and a small tilt could swing the camera through its whole range. (@KlugKlugTG)
+- `CMDeviceMotion` is now produced by a small gyroscope+accelerometer sensor-fusion filter (attitude tracked by integrating the real gyroscope and continuously corrected towards gravity), instead of deriving roll/pitch straight from the raw gravity vector. The old approach blew up in the typical upright, landscape gaming hold — where gravity's out-of-screen component is ~0 — so a small tilt could swing the estimated attitude straight to its extremes (games like Asphalt 7 would snap the camera to maximum on the slightest tilt). `userAcceleration` is now also reported (raw acceleration minus the fused gravity estimate). For smoothness the visible motion is dominated by the continuous gyroscope integration, with gravity only gently correcting long-term drift, and the gravity correction is automatically distrusted whenever the accelerometer magnitude deviates from 1g (device being shaken), so sensor noise and hand jitter no longer leak into the on-screen camera. (@KlugKlugTG)
+- Fixed `CMDeviceMotion.attitude` reporting pitch and roll about the wrong device axes (they were effectively swapped, with mismatched signs, and inconsistent with the returned quaternion). Games that tilt-steer or swing a 3D camera using Core Motion device motion (e.g. Asphalt 7's tilt camera) should now move the view in the correct direction for the actual device rotation. (@KlugKlugTG)
+- Added a per-game accelerometer escape hatch for games whose tilt controls come out mirrored or sideways on the host device: set the environment variable `TOUCHHLE_ACCELEROMETER_AXES` to a comma-separated list choosing any of `swap`, `flipx`, `flipy` (e.g. `TOUCHHLE_ACCELEROMETER_AXES=swap,flipy`). It applies to real hardware-sensor data only and is read once at startup.
+- The Objective-C runtime's hot lookup tables (object map, method tables, initialized-classes set and related bookkeeping) now use a fast integer-oriented hasher instead of the standard-library default SipHash, cutting a handful of hashes done for every guest message send and every retain/release/autorelease down to a multiply-rotate each.
+- Two compatibility probes that ran on every single guest message send (NSArray subscripting and the GDataXML layer) no longer allocate selector/class-name Strings per message; they now reject non-matching messages allocation-free.
+- The guest-memory read/write fast path (`read`, `write`, `bytes_at`, `bytes_at_mut`, `ptr_at`, `ptr_at_mut`) is now marked `#[inline]` so callers in hot framework code don't pay a call and re-derivation each access.
+- Implemented true frame pacing in the EAGL presentation path, making the picture noticeably smoother: the frame limiter now paces the guest to an exact frame deadline using a hybrid timer — a cooperative `env.sleep()` until shortly before the deadline (other guest threads still run) followed by a short spin-wait for the last ~2ms. Previously the pacing sleep was a plain timer sleep that could wake several ms late, starting the guest's next frame late and visibly wobbling the frame cadence (micro-stutter). The wake-up now lands within tens of microseconds of the deadline.
+- The CPU scheduler batch is now adaptive: 1,000,000 ticks during long busy stretches, automatically reduced to 100,000 whenever any guest thread has an imminent wake deadline (<10ms), so frame pacing, run-loop timers and audio callbacks stay millisecond-precise.
+- Major performance optimisation pass, focused on game FPS on Android devices:
+  - The dynarmic CPU JIT now enables its "unsafe" floating-point/codegen optimizations (`Unsafe_UnfuseFMA`, `Unsafe_ReducedErrorFP`, `Unsafe_InaccurateNaN`, `Unsafe_IgnoreStandardFPCRValue`; the accuracy differences are limited to FP edge cases that games don't depend on), so VFP/NEON-heavy guest code no longer pays for per-instruction NaN/rounding bookkeeping where the backend supports these switches (currently the x86-64 JIT backend; on AArch64 hosts the flags are accepted but don't change emitted code yet). `Unsafe_IgnoreGlobalMonitor` deliberately stays off so guest atomics remain correct on multithreaded apps.
+  - The CPU scheduler batch was raised from 100,000 to 1,000,000 ticks, amortising JIT exits, coroutine switches and scheduler passes ~10x better. Event polling keeps its independent 120 Hz throttle and guest thread wakeups are deadline-based, so input and timer responsiveness are unaffected.
+  - The release profile now uses fat (whole-program) LTO instead of thin LTO, letting LLVM inline across all crate boundaries in the hottest emulation paths.
+  - The global allocator is now mimalloc, which handles the emulator's small-allocation-heavy workload (autorelease pools, string and collection churn in the HLE frameworks) measurably faster than the platform allocator, especially on Android.
+  - On Android the emulator thread's scheduling priority is raised via SDL's `SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)`, keeping the emulation loop on big CPU cores on big.LITTLE SoCs.
+  - The window framebuffer no longer requests depth/stencil buffers it never uses (everything host-drawn is a flat textured quad), saving a swap chain resolution's worth of bandwidth on tile-based mobile GPUs.
+  - Per-frame/per-touch `getenv`-style debug toggle checks (`TOUCHHLE_*` env vars on the present, viewport, draw-call, hit-test and touch-remap paths) are now read once and cached; previously several of them ran an environ scan with locking and allocation on every frame or touch event.
+
+Usability:
+
+- Opening the app picker now plays the iOS 4-style home screen unlock animation: the app icons and their labels fly in radially from outside the screen into their grid slots, with inner icons leading and outer corners settling right after.
+
+- The app picker has been reworked to feel like iOS. Opening an app animates its icon to the middle of the screen while the screen fades to black. Pressing the arrow tiles or the ← and → keys slides the icon grid to the next or previous page. The "Quick options" button is gone; a new "Settings" app icon in the grid opens a full-screen Settings screen with grouped sections, switches, and a "Done" button. It holds the same options as before.
+
+- Long-pressing an app icon in the app picker opens an iOS-style “Delete” dialog. Deleting an app removes its bundle, its saved data in `touchHLE_sandbox`, and its SQLite databases in `touchHLE_sqlite`.
+
+- The app picker's Settings screen has a new “Language” dropdown in the Device section. “Auto” (the default) uses the host's language, and the other choices pass `--preferred-languages=` to the app.
+
+- Quick Options now has a “May fix graphics issues.” switch for `--force-composition`, including an explicit off state that overrides app-specific defaults. Switches are aligned beside their labels, and the scale-hack button text no longer gets clipped. (@j92580498-max)
+
+## v0.2.3 (2026-01-02)
+
+Compatibility:
+
+- New working apps:
+  - Dungeon Hunter (@ciciplusplus)
+  - Crystal Defenders: Vanguard Storm (@ciciplusplus)
+  - Zombie Infection (@ciciplusplus)
+  - Gangstar: West Coast Hustle (@ciciplusplus)
+  - Asphalt 4: Elite Racing (@ciciplusplus)
+  - Prince of Persia: Warrior Within (@ciciplusplus)
+  - Resident Evil 4: Mobile Edition (@alborrajo)
+  - Command & Conquer: Red Alert (@ciciplusplus)
+  - SimCity (@ciciplusplus)
+  - Asphalt 5 (@ciciplusplus, @hikari-no-yume)
+  - Cut the Rope (@ciciplusplus)
+  - Skater Nation (@ciciplusplus)
+  - Iron Man 2 (@ciciplusplus)
+  - Shrek Forever After (@ciciplusplus)
+  - Spore Origins (@ciciplusplus, @hikari-no-yume, @teromene)
+  - Defender Chronicles (@hujerhoe)
+  - Real Racing (@ciciplusplus)
+  - Tom Clancy's Splinter Cell: Conviction (@ciciplusplus)
+  - Assassin's Creed (@ciciplusplus)
+  - N.O.V.A. Near Orbit Vanguard Alliance (@ciciplusplus)
+  - Brothers in Arms 2: Global Front (@ciciplusplus)
+  - Ferrari GT: Evolution (@ciciplusplus)
+  - Castle Frenzy (@ciciplusplus)
+  - Hero of Sparta 2 (@ciciplusplus)
+  - Hero of Sparta (@ciciplusplus)
+  - Bridge Odyssey (@ciciplusplus)
+  - Terminator Salvation (@ciciplusplus)
+  - Brothers In Arms: Hour Of Heroes (@ciciplusplus)
+  - Crusade Of Destiny (@ciciplusplus)
+  - Arvale (@ciciplusplus)
+  - Battlefield: Bad Company 2 (@ciciplusplus)
+  - Ms. PAC-MAN (@acieslewicz)
+  - Dark Nebula (@ciciplusplus)
+  - FIFA 10 (@ciciplusplus)
+  - Crash Bandicoot Nitro Kart 2 (@ciciplusplus)
+  - Driver (@ciciplusplus)
+  - Sacred Odyssey: Rise of Ayden (@ciciplusplus)
+  - Nanosaur 2 (@ciciplusplus)
+  - Cro-Mag Rally (@ciciplusplus)
+  - Bugdom 2 (@ciciplusplus)
+- API support improvements:
+  - Various small contributions. (@hikari-no-yume, @alborrajo, @ciciplusplus, @atasro2, @abnormalmaps, @hujerhoe, @acieslewicz, @WhatAmISupposedToPutHere, @JaGoTu, @apexad, @chyyran, @mistydemeo, @bognarit80, @RMZeroFour)
+  - UITextField now supports real text input with a keyboard. On Windows/macOS physical keyboard is used, on Android it's done via a system soft keyboard. (@ciciplusplus)
+  - UIScrollView and UITextView partial implementations. (@Skryptonyte, @ciciplusplus)
+  - Core Animation and UIKit now support affine transforms, allowing UI elements to be rotated, a feature needed by [several games](https://github.com/touchHLE/touchHLE/issues/388). Note however that auto-rotation is not yet supported. (@hikari-no-yume)
+  - Partial support for Core Animation explicit animations has been added. (@alborrajo)
+  - The libz dynamic library is now available, [compiled from source](https://github.com/touchHLE/zlib-dylib) using a [clean open-source toolchain](https://github.com/touchHLE/common-3.0-sdk). (@acieslewicz)
+  - ALAC and Microsoft IMA ADPCM are now supported in Audio Toolbox, with the same caveats as other compressed codecs. (@abnormalmaps)
+  - Switched to ARMv7 rather than ARMv6 versions of libstdc++ and libgcc. (@acieslewicz)
+  - Added support for certain iPhone OS 3.1 binary format changes (iPhone OS 3.1 apps are still considered unsupported). (@bognarit80)
+  - Limited support for local multiplayer via Wi-Fi in some games. (@ciciplusplus)
+
+Usability:
+
+- The app picker now has an iOS-style “+” tile (the first icon in the grid) for adding a game. Tapping it lets the user pick an .ipa file, which is simply copied into the touchHLE_apps directory, and the grid then refreshes automatically. (@KlugKlugTG)
+- Default options for various games have been added or improved. (@celerizer, @nighto)
+- The app picker now has a “Quick options” feature. This provides a quicker and easier way to set some common options. (@hikari-no-yume)
+- App icons in the app picker are now sorted by the display name of the app, case-insensitively. (@hikari-no-yume)
+- The accelerometer (tilt controls) can now be simulated using a mouse, instead of a game controller or real accelerometer. Simply hold down the right mouse button and move the mouse cursor. (@alborrajo)
+- The new `--disable-analog-stick-tilt-controls` option can be used to disable the use of the game controller's analog sticks for accelerometer simulation. This is useful on devices with both an integrated game controller and an integrated accelerometer, as touchHLE by default will only use the real accelerometer if no game controller is detected. (@hikari-no-yume)
+- Android builds and releases of touchHLE now have an icon and meaningful version metadata. They also now use a different package name for preview builds versus releases, which means you can install them side-by-side. (@hikari-no-yume)
+- macOS builds and releases of touchHLE now come as an application bundle (`.app` directory) rather than as a bare “Unix executable” file. This should fix problems some users encountered with running touchHLE outside of a terminal, and allows putting touchHLE in the Applications folder like a normal graphical app. To support this, user data (apps, options, etc) is now stored in “Application Support” rather than the current directory, and the bundled files (fonts, dylibs, etc) are now part of the app bundle. If you prefer the old layout, you can still get it if you move all the files out of the bundle. (@hikari-no-yume)
+- The “File manager” button on Android now works more reliably, especially the first time it is tapped. (@hikari-no-yume)
+- The new `--force-composition=` option has been added, which is a workaround that may solve rendering issues in some games, at the cost of performance. For some games it is applied by the default options. (@ciciplusplus)
+- Most errors causing touchHLE to crash now produce a graphical message box, rather than the error message only being found in the log. (@abnormalmaps)
+- touchHLE now writes log messages to a file on all platforms, not just on Android. The file has been renamed from `log.txt` to `touchHLE_log.txt`. (@hikari-no-yume)
+- Two new options for input handling of analog stick (`--stick-to-touch=`) and 8-directional DPad (`--dpad-to-touch=`) via a game controller. (@celerizer)
+
+Quality:
+
+- Fixed an issue on some Android phones where the accelerometer was not usable. (@Oscar1640)
+- Fixed multi-touch in some games. (@ciciplusplus)
+- App icons are now displayed with a glossy sheen where required. (@hikari-no-yume)
+- The app icons and labels in the app picker are now displayed at integer pixel offsets, making them sharper and more symmetrical. (@hikari-no-yume)
+
+Other:
+
+- MP3 decoding now uses Symphonia rather than dr\_mp3. We do not expect this to affect compatibility. (@abnormalmaps)
+
+## v0.2.2 (2024-04-01)
+
+Compatibility:
+
+- New working apps:
+  - Rayman 2 (@ciciplusplus)
+  - Tony Hawk's Pro Skater 2 (@ciciplusplus)
+  - Earthworm Jim (@ciciplusplus)
+  - Castle of Magic (@ciciplusplus)
+- API support improvements:
+  - Various small contributions. (@alborrajo, @WhatAmISupposedToPutHere, @ciciplusplus, @hikari-no-yume, @abnormalmaps, @Skryptonyte, @teromene)
+  - AAC audio files (AAC-LC in a typical MPEG-4 container) are now supported in Audio Toolbox. This is done in a fairly hacky way so it might not work for some apps. (@hikari-no-yume)
+- There is now support for iPhone OS 3.0 apps, in addition to the existing support for iPhone OS 2.x apps:
+  - Support for fat binaries has been added. touchHLE will no longer crash when trying to run an app with both ARMv6 and ARMv7 versions, and instead will try to pick the best available option (ARMv7, or failing this, ARMv6). This improves compatibility with iPhone OS 3.0 apps, many of which use fat binaries in order to improve performance on the iPhone 3GS and iPod touch (3rd generation). (@WhatAmISupposedToPutHere)
+  - The bundled ARMv6 dynamic libraries, libgcc and libstdc++, have been updated to their iPhone OS 3.0.1 versions. Previously the iPhone OS 2.2.1 versions were used. (@hikari-no-yume)
+  - touchHLE will no longer output a warning when trying to run an app with iPhone OS 3.0 as its minimum OS version. The warning now only appears for apps requiring iPhone OS 3.1 and later. (@hikari-no-yume)
+
+Usability:
+
+- The `--button-to-touch=` option now supports the Start and the LeftShoulder buttons in addition to the A/B/X/Y buttons and D-pad. Certain games' default options have been adjusted to use them. (@nighto)
+- Default options for various games (@nighto)
+
+## v0.2.1 (2023-10-31)
+
+From this release onwards, the old list of supported apps is replaced by the crowdsourced touchHLE app compatibility database.
+
+Compatibility:
+
+- API support improvements:
+  - Various small contributions. (@hikari-no-yume, @ciciplusplus, @alborrajo)
+- New working apps:
+  - Doom (@ciciplusplus)
+  - Doom II RPG (@alborrajo)
+  - I Love Katamari (@ciciplusplus)
+  - Wolfenstein RPG (@alborrajo)
+
+Quality:
+
+- Multi-touch is now supported. (@ciciplusplus)
+
+Usability:
+
+- The Android version of touchHLE now has a _documents provider_. Thanks to a mere three hundred lines of boilerplate code [originally written for the emulator Skyline](https://github.com/skyline-emu/skyline/blob/dc20a615275f66bee20a4fd851ef0231daca4f14/app/src/main/java/emu/skyline/provider/DocumentsProvider.kt) (RIP), it is now possible for you, as the owner of a device running a newer Android version, to move ~~files~~ _documents_ in and out of touchHLE's ~~directory~~ _location_ on your device with relative ease. For example, it is now possible to download an ~~.ipa file~~ _`application/octet-stream` document_ to the Downloads folder of your device, then, using an appropriate app, move this _document_ to the touchHLE _location_. Users of normal operating systems and [older versions of Android](https://developer.android.com/about/versions/11/privacy/storage#other-apps-data) continue to be able to access a superior version of the same functionality via a so-called “file manager”. (@hikari-no-yume)
+- There is now an “Open file manager” button in the app picker, to make it easier to find where touchHLE stores your apps and settings. On most operating systems this opens the relevant directory in a file manager, and on Android it opens some sort of app for managing _documents_ in the touchHLE _location_. (@hikari-no-yume)
+- The Android version of touchHLE now writes all log messages to a file called `log.txt`, in addition to outputting them to logcat. (@hikari-no-yume)
+- The new `--stabilize-virtual-cursor=` option makes the analog stick-controlled virtual cursor appear more stable to the emulated app, which is helpful in some games with overly sensitive menu scrolling. In some titles it is applied by default. (@hikari-no-yume; special thanks: @wareya)
+- Automatic language detection now works on all platforms, and supports a list of languages in order of preference, rather than just one. The `LANG` environment variable is no longer supported, and instead the new `--preferred-languages=` option can be used. Note that it is the emulated app itself that decides what to do with this list, and whether particular languages are supported. (@hikari-no-yume)
+- The app picker now has multiple pages, so it is no longer limited to 16 apps. (@hikari-no-yume)
+- The framerate is now limited to 60fps by default, which matches the original iPhone OS and fixes issues with some games where the game ran too fast or consumed excessive energy and CPU time. This limit can be adjusted or disabled with the new `--limit-fps=` option. (@hikari-no-yume; special thanks: @wareya)
+- The `--button-to-touch=` option now supports D-pad mappings in addition to the A/B/X/Y buttons. (@alborrajo)
+- Default game controller button mappings have been added for Wolfenstein RPG and Doom II RPG, including for the D-pad. (@alborrajo)
+
+## v0.2.0 (2023-08-31)
+
+Compatibility:
+
+- API support improvements:
+  - Various small contributions. (@hikari-no-yume, @KiritoDv, @ciciplusplus, @TylerJaacks, @abnormalmaps)
+  - PVRTC and paletted texture compression is now supported. (@hikari-no-yume)
+  - Some key pieces of UIKit and Core Animation are now implemented: layer and view hierarchy, layer and view drawing, layer compositing, touch input hit testing, `UIImageView`, `UILabel`, `UIControl`, and `UIButton`. Previously, touchHLE could only support apps that draw everything with OpenGL ES, which is only common for games. This lays the groundwork for supporting games that rely on UIKit, and possibly some non-game apps. (@hikari-no-yume)
+  - Threads can now sleep, join other threads, and block on mutexes. (@abnormalmaps, @hikari-no-yume)
+
+- New supported apps:
+  - Fastlane Street Racing (@hikari-no-yume)
+  - Mystery Mania (@KiritoDv)
+  - [Wolfenstein 3D](https://www.youtube.com/watch?v=omViNgUqF8c) (@ciciplusplus; version 1.0 only)
+  - Many old apps by Donut Games (@ciciplusplus)
+
+Quality and performance:
+
+- Fixed opaque `COMPRESSED_RGB_PVRTC_*` textures rendering as a black screen (with working audio and touch input) on hosts that lack `GL_IMG_texture_compression_pvrtc` and therefore software-decode PVRTC to RGBA — for example Adreno/Mali devices and the GLES1-on-GL2 layer. Per the `IMG_texture_compression_pvrtc` spec the RGB variants have a base internal format of RGB, so their sampled alpha must be 1.0; the software decoder was instead keeping the PVRTC block's stray per-texel alpha and uploading as `GL_RGBA`, so apps that draw with `GL_BLEND` + `GL_SRC_ALPHA` blended their world away to nothing. The decoded alpha is now forced opaque (and uploaded with a matching `GL_RGB` base format) for the RGB variants, across all GLES backends.
+- Overlapping characters in text now render correctly. (@Xertes0)
+- touchHLE now avoids polling for events more often than 120Hz. Previously, it would sometimes poll many times more often than that, which could be very bad for performance. This change improves performance in basically all apps, though the effects on the supported apps from previous releases are fairly subtle. (@hikari-no-yume)
+- The macOS-only memory leak of up to 0.4MB/s seems to have been fixed! (@hikari-no-yume)
+- App icons are now displayed with rounded corners, even if the PNG file contains a square image. This is more accurate to what iPhone OS does. (@hikari-no-yume)
+- The memory allocator is a lot faster now. (@hikari-no-yume)
+
+New platform support:
+
+- touchHLE is now available for Android. Only AArch64 devices are supported. (@ciciplusplus, @hikari-no-yume)
+
+Usability:
+
+- touchHLE now supports real accelerometer input on devices with a built-in accelerometer, such as phones and tablets. This is only used if no game controller is connected. (@hikari-no-yume)
+- The options help text is now available as a file (`OPTIONS_HELP.txt`), so you don't have to use the command line to get a list of options. (@hikari-no-yume)
+- The new `--fullscreen` option lets you display an app in fullscreen rather than in a window. This is independent of the internal resolution/scale hack and supports both upscaling and downscaling. (@hikari-no-yume)
+- touchHLE now has a built-in app picker with a pretty icon grid. Specifying an app on the command line bypasses it. (@hikari-no-yume)
+- The new `--button-to-touch=` option lets you map a button on your game controller to a point on the touch screen. touchHLE also now includes default button mappings for some games. (@hikari-no-yume)
+- The new `--print-fps` option lets you monitor the framerate from the console. (@hikari-no-yume)
+
+Other:
+
+- To assist with debugging and development, touchHLE now has a primitive implementation of the GDB Remote Serial Protocol. GDB can connect to touchHLE over TCP and set software breakpoints, inspect memory and registers, step or continue execution, etc. This replaces the old `--breakpoint=` option, which is now removed. (@hikari-no-yume)
+- The version of SDL2 used by touchHLE has been updated to 2.26.4. (@hikari-no-yume)
+- Building on common Linux systems should now work without problems, and you can use dynamic linking for SDL2 and OpenAL if you prefer. Note that we are not providing release binaries. (@GeffDev)
+- Some major changes have been made to how touchHLE interacts with graphics drivers:
+  - touchHLE can now use a native OpenGL ES 1.1 driver where available, rather than translating to OpenGL 2.1. This is configurable with the new `--gles1=` option. (@hikari-no-yume)
+  - The code for presenting rendered frames to the screen has been rewritten for compatibility with OpenGL ES 1.1. (@hikari-no-yume)
+  - The splash screen is now drawn with OpenGL ES 1.1, either natively or via translation to OpenGL 2.1, rather than with OpenGL 3.2. (@hikari-no-yume)
+
+  Theoretically, none of these changes should affect how touchHLE behaves for ordinary users in supported apps, but graphics drivers are inscrutable and frequently buggy beasts, so it's hard to be certain. As if to demonstrate this, these changes somehow fixed the mysterious macOS-only memory leak.
+- The new `--headless` option lets you run touchHLE with no graphical output and no input whatsoever. This is only useful for command-line apps. (@hikari-no-yume)
+
+## v0.1.2 (2023-03-07)
+
+Compatibility:
+
+- API support improvements:
+  - Various small contributions. (@hikari-no-yume, @nitinseshadri)
+  - Some key parts of `UIImage`, `CGImage` and `CGBitmapContext` used by Apple's `Texture2D` sample code are now implemented. Loading textures from PNG files in this way should now work. (@hikari-no-yume)
+  - MP3 is now a supported audio file format in Audio Toolbox. This is done in a fairly hacky way so it might not work for some apps. (@hikari-no-yume)
+- New supported apps:
+  - Touch & Go LITE (@hikari-no-yume)
+  - Touch & Go \[added to changelog after release: 2023-03-12\] (@hikari-no-yume)
+  - Super Monkey Ball Lite (@hikari-no-yume; full version was already supported)
+
+Quality:
+
+- The version of stb\_image used by touchHLE has been updated. The new version includes a fix for a bug that caused many launch images (splash screens) and icons to fail to load. Thank you to @nothings and @rygorous who diagnosed and fixed this.
+
+Usability:
+
+- The virtual cursor controlled by the right analog stick now uses a larger portion of the analog stick's range. (@hikari-no-yume)
+- Basic information about the app bundle, such as its name and version number, is now output when running an app. There is also a new command-line option, `--info`, which lets you get this information without running the app. (@hikari-no-yume)
+- You are now warned if you try to run an app that requires a newer iPhone OS version. (@hikari-no-yume)
+- Options can now be loaded from files. (@hikari-no-yume)
+  - The recommended options for supported apps are now applied automatically. See the new `touchHLE_default_options.txt` file.
+  - You can put your own options in the new `touchHLE_options.txt` file.
+  - If you're a Windows user, this means that dragging and dropping an app onto `touchHLE.exe` is now all you need to do to run an app.
+
+Other:
+
+- The version of dynarmic used by touchHLE has been updated. This will fix build issues for some people. (@hikari-no-yume)
+
+## v0.1.1 (2023-02-18)
+
+Compatibility:
+
+- API support improvements:
+  - Various small contributions. (@hikari-no-yume, @nitinseshadri, @abnormalmaps, @RealSupremium)
+  - Basic POSIX file I/O is now supported. Previously only standard C file I/O was supported. (@hikari-no-yume)
+  - Very basic use of Audio Session Services is now supported. (@nitinseshadri)
+  - Very basic use of `MPMoviePlayerController` is now supported. No actual video playback is implemented. (@hikari-no-yume)
+- New supported app: Crash Bandicoot Nitro Kart 3D (@hikari-no-yume; version 1.0 only).
+
+Quality and performance:
+
+- The code that limits CPU use has reworked in an attempt to more effectively balance responsiveness and energy efficiency. Frame pacing should be more consistent and slowdowns should be less frequent. No obvious impact on energy use has been observed. (@hikari-no-yume)
+- The emulated CPU can now access memory via a more direct, faster path. This can dramatically improve performance and reduce CPU/energy use, in some cases by as much as 25%. (@hikari-no-yume)
+- Fixed missing gamma encoding/decoding when rendering text using `UIStringDrawing`. This was making the text in _Super Monkey Ball_'s options menu look pretty ugly. (@hikari-no-yume)
+
+Usability:
+
+- `.ipa` files can now be opened directly, you don't need to extract the `.app` first. (@DCNick3)
+- New command-line options `--landscape-left` and `--landscape-right` let you change the initial orientation of the device. (@hikari-no-yume)
+- The app bundle or `.ipa` file no longer has to be the first command-line argument. (@hikari-no-yume)
+
+Other:
+
+- Some of the more spammy warning messages have been removed or condensed. (@hikari-no-yume)
+
+## v0.1.0 (2023-02-02)
+
+First release.

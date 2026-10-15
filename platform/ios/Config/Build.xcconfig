@@ -1,0 +1,42 @@
+PRODUCT_NAME = HyperHLE
+PRODUCT_BUNDLE_IDENTIFIER = com.klugklug.hyperhle
+MARKETING_VERSION = 1.0.0
+CURRENT_PROJECT_VERSION = 1
+IPHONEOS_DEPLOYMENT_TARGET = 15.0
+TARGETED_DEVICE_FAMILY = 1,2
+SUPPORTED_PLATFORMS = iphoneos iphonesimulator
+SDKROOT = iphoneos
+ARCHS = arm64
+CLANG_ENABLE_MODULES = YES
+CLANG_C_LANGUAGE_STANDARD = gnu17
+SWIFT_VERSION = 5.0
+SWIFT_OBJC_BRIDGING_HEADER = Sources/TouchHLEHost-Bridging-Header.h
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) GLES_SILENCE_DEPRECATION=1
+ENABLE_BITCODE = NO
+COPY_PHASE_STRIP = NO
+GENERATE_INFOPLIST_FILE = NO
+INFOPLIST_FILE = Config/Info.plist
+CODE_SIGN_ENTITLEMENTS = Config/TouchHLEHost.entitlements
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+TOUCHHLE_REPO = $(SRCROOT)/../..
+
+// The emulator cores are dylibs the app loads at runtime, and SDL2 is a shared
+// library both the app and whichever core is loaded link against. Embed-Cores
+// (a shell script build phase) copies them into the bundle's Frameworks folder.
+RUST_BUILD_DIR = $(TOUCHHLE_REPO)/build/rust-ios-native
+RUST_LIB_DIR[config=Debug][sdk=iphonesimulator*] = $(RUST_BUILD_DIR)/aarch64-apple-ios-sim/debug
+RUST_LIB_DIR[config=Release][sdk=iphonesimulator*] = $(RUST_BUILD_DIR)/aarch64-apple-ios-sim/release
+RUST_LIB_DIR[config=Debug][sdk=iphoneos*] = $(RUST_BUILD_DIR)/aarch64-apple-ios/debug
+RUST_LIB_DIR[config=Release][sdk=iphoneos*] = $(RUST_BUILD_DIR)/aarch64-apple-ios/release
+SDL_SHARED_DIR[sdk=iphonesimulator*] = $(TOUCHHLE_REPO)/build/sdl-shared-iphonesimulator/install
+SDL_SHARED_DIR[sdk=iphoneos*] = $(TOUCHHLE_REPO)/build/sdl-shared-iphoneos/install
+
+HEADER_SEARCH_PATHS = $(inherited) "$(SDL_SHARED_DIR)/include/SDL2"
+LIBRARY_SEARCH_PATHS = $(inherited) "$(RUST_LIB_DIR)" "$(SDL_SHARED_DIR)/lib"
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/Frameworks
+OTHER_LDFLAGS = $(inherited) -ObjC -lSDL2main -lSDL2 -lc++ -liconv -framework AVFoundation -framework AudioToolbox -framework CoreBluetooth -framework CoreGraphics -framework CoreHaptics -framework CoreMotion -framework Foundation -framework GameController -framework Metal -framework OpenGLES -framework QuartzCore -framework UIKit
+
+// Embed-Cores copies dylibs whose paths depend on the configuration, so it
+// cannot declare a fixed input/output file list.
+ENABLE_USER_SCRIPT_SANDBOXING = NO
+CODE_SIGN_STYLE = Automatic
