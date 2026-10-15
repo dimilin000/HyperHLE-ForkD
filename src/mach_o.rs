@@ -20,11 +20,11 @@
 
 use crate::abi::GuestFunction;
 use crate::fs::{Fs, GuestPath};
-use crate::mem::{GuestUSize, Mem, MutPtr, Ptr};
+use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr};
 use mach_object::{
-    cpu_subtype_t, vm_prot_t, Bind, BindSymbolType, DyLib, LoadCommand, MachCommand, OFile, Rebase,
-    Symbol, SymbolIter, ThreadState, N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS,
-    S_MOD_INIT_FUNC_POINTERS, S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
+    cpu_subtype_t, vm_prot_t, DyLib, LoadCommand, MachCommand, OFile, ThreadState,
+    N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS, S_MOD_INIT_FUNC_POINTERS,
+    S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
 };
 use std::collections::HashMap;
 use std::io::{Cursor, Seek, SeekFrom};
@@ -153,26 +153,497 @@ impl SectionPredicate for SectionType {
     }
 }
 
-fn get_sym_by_idx<'a>(
+#[derive(Debug, Clone)]
+enum ParsedSym<'a> {
+    Debug,
+    Undefined {
+        name: Option<&'a str>,
+    },
+    Prebound {
+        name: Option<&'a str>,
+    },
+    Defined {
+        name: Option<&'a str>,
+        external: bool,
+        entry: u64,
+        desc: u16,
+    },
+}
+
+fn read_nlist_sym<'a>(
+    bytes: &'a [u8],
     idx: u32,
     (symoff, nsyms, stroff, strsize): (u32, u32, u32, u32),
-    is_bigend: bool,
     is_64bit: bool,
-    cursor: &'a mut Cursor<&'a [u8]>,
-) -> Option<mach_object::Symbol<'a>> {
-    if idx >= nsyms {
+) -> Option<ParsedSym<'a>> {
+    // Mask out INDIRECT_SYMBOL_LOCAL (0x80000000) and INDIRECT_SYMBOL_ABS (0x40000000)
+    if (idx & 0xc000_0000) != 0 || idx >= nsyms {
         return None;
     }
+    let nlist_size: usize = if is_64bit { 16 } else { 12 };
+    let entry_off = (symoff as usize).checked_add((idx as usize).checked_mul(nlist_size)?)?;
+    let entry_end = entry_off.checked_add(nlist_size)?;
+    if entry_end > bytes.len() {
+        return None;
+    }
+    let raw = &bytes[entry_off..entry_end];
+    let n_strx = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let n_type = raw[4];
+    let _n_sect = raw[5];
+    let n_desc = u16::from_le_bytes([raw[6], raw[7]]);
+    let n_value: u64 = if is_64bit {
+        u64::from_le_bytes([
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+        ])
+    } else {
+        u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as u64
+    };
 
-    let nlist_size = if is_64bit { 16 } else { 12 };
-    let symoff = (symoff + idx * nlist_size) as u64;
+    // N_STAB = 0xe0
+    if (n_type & 0xe0) != 0 {
+        return Some(ParsedSym::Debug);
+    }
 
-    cursor.seek(SeekFrom::Start(symoff)).unwrap();
+    let name: Option<&'a str> = if n_strx == 0 || n_strx >= strsize {
+        None
+    } else {
+        let str_start = (stroff as usize).checked_add(n_strx as usize)?;
+        let str_limit = (stroff as usize).checked_add(strsize as usize)?.min(bytes.len());
+        if str_start >= str_limit {
+            None
+        } else {
+            let tail = &bytes[str_start..str_limit];
+            let nul_pos = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+            std::str::from_utf8(&tail[..nul_pos]).ok()
+        }
+    };
 
-    // This is not how you're supposed to use SymbolIter but the parse_symbol()
-    // method on it requires the bytestring crate, so...
-    let mut iter = SymbolIter::new(cursor, Vec::new(), 1, stroff, strsize, is_bigend, is_64bit);
-    iter.next()
+    let external = (n_type & 0x01) != 0;
+    match n_type & 0x0e {
+        // N_SECT (0x0e) or N_ABS (0x02)
+        0x0e | 0x02 => Some(ParsedSym::Defined {
+            name,
+            external,
+            entry: n_value,
+            desc: n_desc,
+        }),
+        // N_PBUD (0x0c)
+        0x0c => Some(ParsedSym::Prebound { name }),
+        // N_UNDF (0x00) or N_INDR (0x0a)
+        _ => Some(ParsedSym::Undefined { name }),
+    }
+}
+
+fn read_uleb128(slice: &[u8], pos: &mut usize) -> u64 {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    while *pos < slice.len() {
+        let byte = slice[*pos];
+        *pos += 1;
+        if shift < 64 {
+            result |= ((byte & 0x7f) as u64) << shift;
+        }
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    result
+}
+
+fn read_sleb128(slice: &[u8], pos: &mut usize) -> i64 {
+    let mut result: i64 = 0;
+    let mut shift: u32 = 0;
+    let mut byte: u8 = 0;
+    while *pos < slice.len() {
+        byte = slice[*pos];
+        *pos += 1;
+        if shift < 64 {
+            result |= ((byte & 0x7f) as i64) << shift;
+        }
+        shift += 7;
+        if (byte & 0x80) == 0 {
+            break;
+        }
+    }
+    if shift < 64 && (byte & 0x40) != 0 {
+        result |= (!0i64) << shift;
+    }
+    result
+}
+
+fn read_cstring<'a>(slice: &'a [u8], pos: &mut usize) -> &'a str {
+    let start = *pos;
+    while *pos < slice.len() && slice[*pos] != 0 {
+        *pos += 1;
+    }
+    let end = *pos;
+    if *pos < slice.len() {
+        *pos += 1; // skip NUL
+    }
+    std::str::from_utf8(&slice[start..end]).unwrap_or("")
+}
+
+fn apply_single_rebase(
+    seg_idx: usize,
+    seg_off: u64,
+    is_64bit: bool,
+    segment_offsets: &[u32],
+    slide: u32,
+    into_mem: &mut Mem,
+) {
+    let Some(&seg_base) = segment_offsets.get(seg_idx) else {
+        return;
+    };
+    let addr = seg_base.wrapping_add(seg_off as u32).wrapping_add(slide);
+    if is_64bit {
+        let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
+        let old64: u64 = into_mem.read(ptr64);
+        let low48 = old64 & 0x0000_ffff_ffff_ffff;
+        let new64 = if low48 >= ARM64_DEFAULT_TEXT_BASE
+            && low48 < ARM64_DEFAULT_TEXT_BASE + 0x4000_0000
+        {
+            (rebase_arm64_addr(low48).wrapping_add(slide)) as u64
+        } else if low48 < ARM64_REBASED_TEXT_BASE as u64 && low48 != 0 {
+            (ARM64_REBASED_TEXT_BASE
+                .wrapping_add(low48 as u32)
+                .wrapping_add(slide)) as u64
+        } else {
+            old64
+        };
+        into_mem.write(ptr64, new64);
+    } else {
+        let original_location: MutPtr<u32> = Ptr::from_bits(addr);
+        let old: u32 = into_mem.read(original_location);
+        into_mem.write(original_location, old.wrapping_add(slide));
+    }
+}
+
+fn apply_dyld_rebase(
+    slice: &[u8],
+    ptr_size: u64,
+    is_64bit: bool,
+    segment_offsets: &[u32],
+    slide: u32,
+    into_mem: &mut Mem,
+) {
+    let mut pos: usize = 0;
+    let mut seg_idx: usize = 0;
+    let mut seg_off: u64 = 0;
+    let mut rebase_type: u8 = 1; // REBASE_TYPE_POINTER
+
+    while pos < slice.len() {
+        let byte = slice[pos];
+        pos += 1;
+        let opcode = byte & 0xf0;
+        let imm = byte & 0x0f;
+        match opcode {
+            0x00 => break, // REBASE_OPCODE_DONE
+            0x10 => {
+                rebase_type = imm;
+            }
+            0x20 => {
+                seg_idx = imm as usize;
+                seg_off = read_uleb128(slice, &mut pos);
+            }
+            0x30 => {
+                seg_off = seg_off.wrapping_add(read_uleb128(slice, &mut pos));
+            }
+            0x40 => {
+                seg_off = seg_off.wrapping_add((imm as u64).wrapping_mul(ptr_size));
+            }
+            0x50 => {
+                for _ in 0..imm {
+                    if rebase_type == 1 {
+                        apply_single_rebase(seg_idx, seg_off, is_64bit, segment_offsets, slide, into_mem);
+                    }
+                    seg_off = seg_off.wrapping_add(ptr_size);
+                }
+            }
+            0x60 => {
+                let count = read_uleb128(slice, &mut pos);
+                for _ in 0..count {
+                    if rebase_type == 1 {
+                        apply_single_rebase(seg_idx, seg_off, is_64bit, segment_offsets, slide, into_mem);
+                    }
+                    seg_off = seg_off.wrapping_add(ptr_size);
+                }
+            }
+            0x70 => {
+                let add = read_uleb128(slice, &mut pos);
+                if rebase_type == 1 {
+                    apply_single_rebase(seg_idx, seg_off, is_64bit, segment_offsets, slide, into_mem);
+                }
+                seg_off = seg_off.wrapping_add(add).wrapping_add(ptr_size);
+            }
+            0x80 => {
+                let count = read_uleb128(slice, &mut pos);
+                let skip = read_uleb128(slice, &mut pos);
+                for _ in 0..count {
+                    if rebase_type == 1 {
+                        apply_single_rebase(seg_idx, seg_off, is_64bit, segment_offsets, slide, into_mem);
+                    }
+                    seg_off = seg_off.wrapping_add(skip).wrapping_add(ptr_size);
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_dyld_bind(
+    slice: &[u8],
+    ptr_size: u64,
+    is_64bit: bool,
+    is_weak: bool,
+    is_lazy: bool,
+    segment_offsets: &[u32],
+    slide: u32,
+    into_mem: &mut Mem,
+    external_relocations: &mut Vec<(u32, String)>,
+) {
+    let mut pos: usize = 0;
+    let mut seg_idx: usize = 0;
+    let mut seg_off: u64 = 0;
+    let mut bind_type: u8 = 1; // BIND_TYPE_POINTER
+    let mut sym_name = String::new();
+    let mut addend: i64 = 0;
+    let mut in_threaded_table = false;
+    let mut threaded_symbols: Vec<(String, i64)> = Vec::new();
+
+    let mut do_one_bind = |seg_idx: usize,
+                           seg_off: u64,
+                           bind_type: u8,
+                           sym_name: &str,
+                           addend: i64,
+                           into_mem: &mut Mem,
+                           external_relocations: &mut Vec<(u32, String)>| {
+        if bind_type != 1 || sym_name.is_empty() {
+            return;
+        }
+        let Some(&seg_base) = segment_offsets.get(seg_idx) else {
+            return;
+        };
+        let addr = seg_base.wrapping_add(seg_off as u32).wrapping_add(slide);
+        if is_64bit {
+            let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
+            if is_weak && into_mem.read(ptr64) != 0 {
+                return;
+            }
+            let addend_u64 = (addend as i32 as u32) as u64;
+            into_mem.write(ptr64, addend_u64);
+        } else {
+            let ptr32: MutPtr<u32> = Ptr::from_bits(addr);
+            if is_weak && into_mem.read(ptr32) != 0 {
+                return;
+            }
+            if addend != 0 && into_mem.read(ptr32) == 0 {
+                into_mem.write(ptr32, addend as i32 as u32);
+            }
+        }
+        external_relocations.push((addr, sym_name.to_string()));
+    };
+
+    while pos < slice.len() {
+        let byte = slice[pos];
+        pos += 1;
+        let opcode = byte & 0xf0;
+        let imm = byte & 0x0f;
+        match opcode {
+            0x00 => {
+                // BIND_OPCODE_DONE: in lazy_bind each entry is terminated by DONE,
+                // while in regular/weak bind DONE terminates the stream unless we
+                // were populating the threaded ordinal table.
+                if in_threaded_table {
+                    in_threaded_table = false;
+                } else if !is_lazy {
+                    break;
+                }
+            }
+            0x10 | 0x30 => {
+                // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM / SET_DYLIB_SPECIAL_IMM
+            }
+            0x20 => {
+                // BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB
+                let _ = read_uleb128(slice, &mut pos);
+            }
+            0x40 => {
+                // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
+                sym_name = read_cstring(slice, &mut pos).to_string();
+            }
+            0x50 => {
+                // BIND_OPCODE_SET_TYPE_IMM
+                bind_type = imm;
+            }
+            0x60 => {
+                // BIND_OPCODE_SET_ADDEND_SLEB
+                addend = read_sleb128(slice, &mut pos);
+            }
+            0x70 => {
+                // BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+                seg_idx = imm as usize;
+                seg_off = read_uleb128(slice, &mut pos);
+            }
+            0x80 => {
+                // BIND_OPCODE_ADD_ADDR_ULEB
+                seg_off = seg_off.wrapping_add(read_uleb128(slice, &mut pos));
+            }
+            0x90 => {
+                // BIND_OPCODE_DO_BIND
+                if in_threaded_table {
+                    threaded_symbols.push((sym_name.clone(), addend));
+                } else {
+                    do_one_bind(
+                        seg_idx,
+                        seg_off,
+                        bind_type,
+                        &sym_name,
+                        addend,
+                        into_mem,
+                        external_relocations,
+                    );
+                    seg_off = seg_off.wrapping_add(ptr_size);
+                }
+            }
+            0xA0 => {
+                // BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB
+                let add = read_uleb128(slice, &mut pos);
+                do_one_bind(
+                    seg_idx,
+                    seg_off,
+                    bind_type,
+                    &sym_name,
+                    addend,
+                    into_mem,
+                    external_relocations,
+                );
+                seg_off = seg_off.wrapping_add(add).wrapping_add(ptr_size);
+            }
+            0xB0 => {
+                // BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED
+                do_one_bind(
+                    seg_idx,
+                    seg_off,
+                    bind_type,
+                    &sym_name,
+                    addend,
+                    into_mem,
+                    external_relocations,
+                );
+                seg_off = seg_off.wrapping_add(((imm as u64) + 1).wrapping_mul(ptr_size));
+            }
+            0xC0 => {
+                // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+                let count = read_uleb128(slice, &mut pos);
+                let skip = read_uleb128(slice, &mut pos);
+                for _ in 0..count {
+                    do_one_bind(
+                        seg_idx,
+                        seg_off,
+                        bind_type,
+                        &sym_name,
+                        addend,
+                        into_mem,
+                        external_relocations,
+                    );
+                    seg_off = seg_off.wrapping_add(skip).wrapping_add(ptr_size);
+                }
+            }
+            0xD0 => {
+                // BIND_OPCODE_THREADED
+                match imm {
+                    0x00 => {
+                        // BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB
+                        let cap = read_uleb128(slice, &mut pos) as usize;
+                        threaded_symbols.reserve(cap.min(65536));
+                        in_threaded_table = true;
+                    }
+                    0x01 => {
+                        // BIND_SUBOPCODE_THREADED_APPLY
+                        if let Some(&seg_base) = segment_offsets.get(seg_idx) {
+                            let mut cur_off = seg_off;
+                            for _ in 0..0x10_0000 {
+                                let addr = seg_base
+                                    .wrapping_add(cur_off as u32)
+                                    .wrapping_add(slide);
+                                let raw: u64 = into_mem.read(ConstPtr::from_bits(addr));
+                                let delta = ((raw >> 51) & 0x7ff) * 8;
+                                let is_bind = (raw & (1u64 << 62)) != 0;
+                                if is_bind {
+                                    let ordinal = (raw & 0xffff) as usize;
+                                    if let Some((t_name, t_addend)) =
+                                        threaded_symbols.get(ordinal)
+                                    {
+                                        let addend_u64 = (*t_addend as i32 as u32) as u64;
+                                        into_mem.write(MutPtr::<u64>::from_bits(addr), addend_u64);
+                                        external_relocations.push((addr, t_name.clone()));
+                                    }
+                                } else {
+                                    let target = raw & 0x0007_ffff_ffff_ffff;
+                                    let rebased = if target >= ARM64_DEFAULT_TEXT_BASE {
+                                        rebase_arm64_addr(target).wrapping_add(slide)
+                                    } else {
+                                        ARM64_REBASED_TEXT_BASE
+                                            .wrapping_add(target as u32)
+                                            .wrapping_add(slide)
+                                    };
+                                    into_mem.write(MutPtr::<u64>::from_bits(addr), rebased as u64);
+                                }
+                                if delta == 0 {
+                                    break;
+                                }
+                                cur_off = cur_off.wrapping_add(delta);
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+fn find_dyld_lazy_bind_range(bytes: &[u8], is_64bit: bool) -> Option<(u64, u64)> {
+    let header_size = if is_64bit { 32 } else { 28 };
+    if bytes.len() < header_size {
+        return None;
+    }
+    let ncmds = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+    let mut off = header_size;
+    for _ in 0..ncmds {
+        if off + 8 > bytes.len() {
+            break;
+        }
+        let cmd = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let cmdsize =
+            u32::from_le_bytes([bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]])
+                as usize;
+        if cmdsize < 8 || off + cmdsize > bytes.len() {
+            break;
+        }
+        // LC_DYLD_INFO (0x22) or LC_DYLD_INFO_ONLY (0x80000022)
+        if (cmd == 0x22 || cmd == 0x8000_0022) && cmdsize >= 40 {
+            let lazy_off = u32::from_le_bytes([
+                bytes[off + 32],
+                bytes[off + 33],
+                bytes[off + 34],
+                bytes[off + 35],
+            ]) as u64;
+            let lazy_size = u32::from_le_bytes([
+                bytes[off + 36],
+                bytes[off + 37],
+                bytes[off + 38],
+                bytes[off + 39],
+            ]) as u64;
+            if lazy_size > 0 {
+                return Some((lazy_off, lazy_size));
+            }
+        }
+        off += cmdsize;
+    }
+    None
 }
 
 /// Parsed relocation entry
@@ -557,6 +1028,32 @@ impl MachO {
         let mut entry_point_is_lc_main = false;
 
         let slide = slide_to_address;
+        let mut data_segment_ranges: Vec<(u32, u32)> = Vec::new();
+        for MachCommand(cmd, _) in &commands {
+            if let LoadCommand::SymTab {
+                symoff,
+                nsyms,
+                stroff,
+                strsize,
+            } = *cmd
+            {
+                sym_tab_info = Some((symoff, nsyms, stroff, strsize));
+            } else if let LoadCommand::Segment {
+                ref segname,
+                vmaddr,
+                ..
+            } = *cmd
+            {
+                if &**segname == "__TEXT" && text_segment_base.is_none() {
+                    let v: u32 = if is_64bit {
+                        rebase_arm64_addr(vmaddr as u64)
+                    } else {
+                        vmaddr as u32
+                    };
+                    text_segment_base = Some(v + slide);
+                }
+            }
+        }
 
         for MachCommand(command, _size) in commands {
             match command {
@@ -603,7 +1100,6 @@ impl MachO {
                             false
                         }
                         "__TEXT" => {
-                            assert!(text_segment_base.is_none());
                             text_segment_base = Some(vmaddr + slide);
                             true
                         }
@@ -677,17 +1173,7 @@ impl MachO {
                                 into_mem.bytes_at_mut(Ptr::from_bits(vmaddr + slide), filesize);
                             dst.copy_from_slice(src);
                             if is_64bit && &*segname != "__TEXT" {
-                                for chunk in dst.chunks_exact_mut(8) {
-                                    let raw = u64::from_le_bytes(chunk.try_into().unwrap());
-                                    let low48 = raw & 0x0000_ffff_ffff_ffff;
-                                    if low48 >= ARM64_DEFAULT_TEXT_BASE
-                                        && low48 < ARM64_DEFAULT_TEXT_BASE + 0x4000_0000
-                                    {
-                                        let rebased =
-                                            (rebase_arm64_addr(low48).wrapping_add(slide)) as u64;
-                                        chunk.copy_from_slice(&rebased.to_le_bytes());
-                                    }
-                                }
+                                data_segment_ranges.push((vmaddr + slide, filesize));
                             }
                         }
                     }
@@ -702,48 +1188,36 @@ impl MachO {
                     stroff,
                     strsize,
                 } => {
-                    sym_tab_info = Some((symoff, nsyms, stroff, strsize));
-                    if cursor.seek(SeekFrom::Start(symoff.into())).is_ok() {
-                        let mut cursor = cursor.clone();
-                        let symbols = SymbolIter::new(
-                            &mut cursor,
-                            all_sections.clone(),
-                            nsyms,
-                            stroff,
-                            strsize,
-                            is_bigend,
-                            is_64bit,
-                        );
-                        for symbol in symbols {
-                            if let Symbol::Debug { .. } = symbol {
-                                continue;
-                            }
-                            if let Symbol::Defined {
-                                name: Some(name),
-                                external,
-                                entry,
-                                desc,
-                                ..
-                            } = symbol
-                            {
-                                let entry: u32 = if is_64bit {
-                                    rebase_arm64_addr(entry as u64)
-                                } else {
-                                    entry.try_into().unwrap()
-                                };
-                                let entry = if !is_64bit && (desc & N_ARM_THUMB_DEF != 0) {
-                                    entry | GuestFunction::THUMB_BIT
-                                } else {
-                                    entry
-                                };
-                                record_defined_symbol(
-                                    &mut exported_symbols,
-                                    &mut external_symbols,
-                                    name,
-                                    slide + entry,
-                                    external,
-                                );
+                    let info = (symoff, nsyms, stroff, strsize);
+                    sym_tab_info = Some(info);
+                    for idx in 0..nsyms {
+                        let Some(sym) = read_nlist_sym(bytes, idx, info, is_64bit) else {
+                            continue;
+                        };
+                        if let ParsedSym::Defined {
+                            name: Some(name),
+                            external,
+                            entry,
+                            desc,
+                        } = sym
+                        {
+                            let entry: u32 = if is_64bit {
+                                rebase_arm64_addr(entry)
+                            } else {
+                                entry as u32
                             };
+                            let entry = if !is_64bit && (desc & N_ARM_THUMB_DEF != 0) {
+                                entry | GuestFunction::THUMB_BIT
+                            } else {
+                                entry
+                            };
+                            record_defined_symbol(
+                                &mut exported_symbols,
+                                &mut external_symbols,
+                                name,
+                                slide.wrapping_add(entry),
+                                external,
+                            );
                         }
                     }
                 }
@@ -756,130 +1230,78 @@ impl MachO {
                 } => {
                     let indirectsyms = {
                         let start = indirectsymoff as usize;
-                        let len = nindirectsyms as usize * 4;
-                        if len == 0 || start >= bytes.len() || start + len > bytes.len() {
-                            log!(
-                                "Warning: indirect symbol table out of bounds (offset {:#x}, {} entries, file size {:#x}); skipping.",
-                                indirectsymoff,
-                                nindirectsyms,
-                                bytes.len()
-                            );
+                        let len = (nindirectsyms as usize).saturating_mul(4);
+                        if len == 0 || start >= bytes.len() || start.saturating_add(len) > bytes.len() {
                             &[][..]
                         } else {
                             &bytes[start..start + len]
                         }
                     };
-                    for idx in indirectsyms.chunks(4) {
-                        assert!(!is_bigend);
-                        let idx = u32::from_le_bytes(idx.try_into().unwrap());
-
-                        let mut cursor = cursor.clone();
-                        let sym = get_sym_by_idx(
-                            idx,
-                            sym_tab_info.unwrap(),
-                            is_bigend,
-                            is_64bit,
-                            &mut cursor,
-                        );
-                        indirect_undef_symbols.push(match sym {
-                            // Если имя есть (Some), оно превратится в
-                            // Some(String).
-                            // Если имени нет (None), вернется None, и мы
-                            // избежим паники.
-                            Some(Symbol::Undefined { name, .. }) => name.map(String::from),
-                            Some(Symbol::Prebound { name, .. }) => name.map(String::from),
-                            Some(Symbol::Defined { name, .. }) => name.map(String::from),
-                            // Debug-символы по-прежнему игнорируем
-                            Some(Symbol::Debug { .. }) => None,
-                            None => None,
-                            other => {
-                                log!(
-                                    "Warning: indirect symbol table contains an unexpected symbol kind {:?}; treating as anonymous.",
-                                    other
-                                );
-                                None
-                            }
-                        })
+                    if let Some(info) = sym_tab_info {
+                        for idx_bytes in indirectsyms.chunks_exact(4) {
+                            let idx = u32::from_le_bytes([
+                                idx_bytes[0],
+                                idx_bytes[1],
+                                idx_bytes[2],
+                                idx_bytes[3],
+                            ]);
+                            let sym = read_nlist_sym(bytes, idx, info, is_64bit);
+                            indirect_undef_symbols.push(match sym {
+                                Some(ParsedSym::Undefined { name }) => name.map(String::from),
+                                Some(ParsedSym::Prebound { name }) => name.map(String::from),
+                                Some(ParsedSym::Defined { name, .. }) => name.map(String::from),
+                                Some(ParsedSym::Debug) | None => None,
+                            });
+                        }
                     }
 
                     let extrels = {
                         let start = extreloff as usize;
-                        let len = nextrel as usize * 8;
-                        if len == 0 {
-                            // A zero-length external relocation table is normal
-                            // (no externally-relocated symbols) — don't warn.
-                            &[][..]
-                        } else if start >= bytes.len() || start + len > bytes.len() {
-                            log!(
-                                "Warning: external relocation table out of bounds (offset {:#x}, {} entries, file size {:#x}); skipping.",
-                                extreloff,
-                                nextrel,
-                                bytes.len()
-                            );
+                        let len = (nextrel as usize).saturating_mul(8);
+                        if len == 0 || start >= bytes.len() || start.saturating_add(len) > bytes.len() {
                             &[][..]
                         } else {
                             &bytes[start..start + len]
                         }
                     };
-                    for entry in extrels.chunks(8) {
-                        let entry_arr: [u8; 8] = match entry.try_into() {
-                            Ok(a) => a,
-                            Err(_) => {
-                                log!(
-                                    "Warning: external relocation table entry is not 8 bytes; truncated dynamic symbol table."
-                                );
-                                break;
-                            }
-                        };
+                    for entry in extrels.chunks_exact(8) {
+                        let entry_arr: [u8; 8] = [
+                            entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6],
+                            entry[7],
+                        ];
                         let reloc = Reloc::parse(is_bigend, entry_arr);
                         let Reloc::External {
                             addr,
                             sym_idx,
                             is_pc_relative: false,
                             size,
-                            type_: 0, // generic
+                            type_: 0,
                         } = reloc
                         else {
-                            log!(
-                                "Warning: skipping unsupported external relocation entry: {:?}",
-                                reloc
-                            );
                             continue;
                         };
                         if size != 4 && !(is_64bit && size == 8) {
-                            log!(
-                                "Warning: skipping unsupported external relocation size: {:?}",
-                                reloc
-                            );
                             continue;
                         }
-                        let addr = if split_segs {
-                            addr + first_read_write_segment_base.unwrap()
+                        let base_seg = if split_segs {
+                            first_read_write_segment_base
+                                .or(first_segment_base)
+                                .unwrap_or(0)
                         } else {
-                            addr + first_segment_base.unwrap()
+                            first_segment_base.unwrap_or(0)
                         };
+                        let addr = addr.wrapping_add(base_seg);
 
-                        let mut cursor = cursor.clone();
-                        let sym = get_sym_by_idx(
-                            sym_idx,
-                            sym_tab_info.unwrap(),
-                            is_bigend,
-                            is_64bit,
-                            &mut cursor,
-                        );
-                        match sym {
-                            Some(Symbol::Undefined { name: Some(n), .. }) => {
+                        let Some(info) = sym_tab_info else {
+                            continue;
+                        };
+                        match read_nlist_sym(bytes, sym_idx, info, is_64bit) {
+                            Some(ParsedSym::Undefined { name: Some(n) }) => {
                                 external_relocations.push((addr, String::from(n)));
                             }
-                            Some(Symbol::Defined { entry, desc, .. }) => {
-                                // Apparently these are used for internal
-                                // (intra-binary) relocations, despite being
-                                // in the external section?
-                                //
-                                // Resolve them immediately, there is no value
-                                // in passing these on to Dyld.
+                            Some(ParsedSym::Defined { entry, desc, .. }) => {
                                 let entry = if is_64bit {
-                                    rebase_arm64_addr(entry as u64).wrapping_add(slide)
+                                    rebase_arm64_addr(entry).wrapping_add(slide)
                                 } else {
                                     let e = (entry as u32).wrapping_add(slide);
                                     if desc & N_ARM_THUMB_DEF != 0 {
@@ -894,28 +1316,22 @@ impl MachO {
                                     let addend_low = (addend & 0xffff_ffff) as u32;
                                     into_mem.write(addr_ptr, (entry.wrapping_add(addend_low)) as u64);
                                 } else {
-                                    let addr_ptr = Ptr::from_bits(addr);
+                                    let addr_ptr: MutPtr<u32> = Ptr::from_bits(addr);
                                     let addend: u32 = into_mem.read(addr_ptr);
                                     into_mem.write(addr_ptr, entry.wrapping_add(addend));
                                 }
                             }
-                            Some(Symbol::Prebound { name: Some(n), .. }) => {
+                            Some(ParsedSym::Prebound { name: Some(n) }) => {
                                 if is_64bit && size == 8 {
                                     let ptr_ptr = Ptr::<u64, true>::from_bits(addr);
                                     into_mem.write(ptr_ptr, 0);
                                 } else {
                                     let ptr_ptr = Ptr::<u32, true>::from_bits(addr);
-                                    into_mem.write(ptr_ptr, 0); // Clear prebinding.
+                                    into_mem.write(ptr_ptr, 0);
                                 }
                                 external_relocations.push((addr, String::from(n)));
                             }
-                            other => {
-                                log!(
-                                    "Warning: external relocation references an unexpected symbol kind {:?}; skipping fixup at {:#x}.",
-                                    other,
-                                    addr
-                                );
-                            }
+                            _ => {}
                         };
                     }
                 }
@@ -929,40 +1345,13 @@ impl MachO {
                 LoadCommand::LoadDyLib(DyLib { name, .. }) => {
                     dynamic_libraries.push(String::from(&*name));
                 }
-                // Old-style entry point PC command
                 LoadCommand::UnixThread { state, .. } => {
-                    let ThreadState::Arm {
-                        __r: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                        __sp: 0,
-                        __lr: 0,
-                        __pc: pc,
-                        __cpsr: 0,
-                    } = state
-                    else {
-                        log!(
-                            "Warning: unexpected initial thread state in {:?}: {:?}; falling back to extracted PC if present.",
-                            name,
-                            state
-                        );
-                        // Try to read the PC anyway; otherwise leave entry
-                        // unset which will surface as a clear error later.
-                        if let ThreadState::Arm { __pc, .. } = state {
-                            if entry_point_pc.is_none() {
-                                entry_point_pc = Some(__pc);
-                            }
+                    if let ThreadState::Arm { __pc, .. } = state {
+                        if entry_point_pc.is_none() {
+                            entry_point_pc = Some(__pc);
                         }
-                        continue;
-                    };
-                    if entry_point_pc.is_some() {
-                        log!(
-                            "Warning: multiple initial thread states in {:?}; ignoring extra entries.",
-                            name
-                        );
-                        continue;
                     }
-                    entry_point_pc = Some(pc);
                 }
-                // New-style entry point PC command
                 LoadCommand::EntryPoint {
                     entryoff,
                     stacksize,
@@ -970,15 +1359,13 @@ impl MachO {
                     if stacksize != 0 {
                         log!("TODO: stack size of {:#x} bytes requested", stacksize);
                     }
-                    // There should only be a single entry point.
-                    // (Presumably an executable won't use both commands?)
-                    assert!(entry_point_pc.is_none());
-                    let entryoff: u32 = entryoff.try_into().unwrap();
-                    entry_point_pc = Some(text_segment_base.unwrap() + entryoff);
+                    let entryoff: u32 = entryoff as u32;
+                    let base = text_segment_base
+                        .or(first_segment_base)
+                        .unwrap_or(if is_64bit { ARM64_REBASED_TEXT_BASE + slide } else { slide });
+                    entry_point_pc = Some(base.wrapping_add(entryoff));
                     entry_point_is_lc_main = true;
                 }
-                // Used in iOS 3.1+ apps. Also contains info about
-                // weak and lazy binds.
                 LoadCommand::DyldInfo {
                     rebase_off,
                     rebase_size,
@@ -992,207 +1379,112 @@ impl MachO {
                         bytes: &'a [u8],
                         off: u64,
                         size: u64,
-                        kind: &str,
-                        name: &str,
                     ) -> &'a [u8] {
-                        // Convert to host usize with bounds checking — a truncated
-                        // Mach-O (e.g. a corrupt IPA) can declare a dyld_info range
-                        // that runs past EOF, and the raw slice panics with
-                        // "range end index N out of range for slice of length M".
-                        // Apple's dyld bails out on the binary; we degrade
-                        // gracefully and load the rest.
                         let Ok(off_usize) = usize::try_from(off) else {
-                            log!(
-                                "Warning: {} dyld_info range starts at {:#x} past host usize \
-                                 in {:?}; skipping.",
-                                kind,
-                                off,
-                                name
-                            );
                             return &[];
                         };
                         let Ok(size_usize) = usize::try_from(size) else {
-                            log!(
-                                "Warning: {} dyld_info range size {:#x} past host usize \
-                                 in {:?}; skipping.",
-                                kind,
-                                size,
-                                name
-                            );
                             return &[];
                         };
                         let Some(end) = off_usize.checked_add(size_usize) else {
-                            log!(
-                                "Warning: {} dyld_info range {:#x}..{:#x}+{:#x} overflows \
-                                 in {:?}; skipping.",
-                                kind,
-                                off_usize,
-                                off_usize,
-                                size_usize,
-                                name
-                            );
                             return &[];
                         };
                         if end > bytes.len() {
-                            log!(
-                                "Warning: {} dyld_info range {:#x}..{:#x} past end of \
-                                 Mach-O file ({:#x}) in {:?}; skipping.",
-                                kind,
-                                off_usize,
-                                end,
-                                bytes.len(),
-                                name
-                            );
                             return &[];
                         }
                         &bytes[off_usize..end]
                     }
 
-                    let ptr_size = if is_64bit { 8 } else { size_of::<GuestUSize>() };
+                    let ptr_size: u64 = if is_64bit { 8 } else { 4 };
 
-                    let rebase_opcodes = Rebase::parse(
-                        checked_dyld_info_slice(
+                    if rebase_size > 0 {
+                        let slice = checked_dyld_info_slice(
                             bytes,
                             rebase_off as u64,
                             rebase_size as u64,
-                            "rebase",
-                            &name,
-                        ),
-                        ptr_size,
-                    );
-
-                    for symb in rebase_opcodes {
-                        match symb.symbol_type {
-                            BindSymbolType::Pointer => {
-                                let Some(&seg_base) = segment_offsets.get(symb.segment_index)
-                                else {
-                                    continue;
-                                };
-                                let addr = seg_base
-                                    + symb.symbol_offset as u32
-                                    + slide;
-                                if is_64bit {
-                                    let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
-                                    let old64: u64 = into_mem.read(ptr64);
-                                    let low48 = old64 & 0x0000_ffff_ffff_ffff;
-                                    let new64 = if low48 >= ARM64_DEFAULT_TEXT_BASE
-                                        && low48 < ARM64_DEFAULT_TEXT_BASE + 0x4000_0000
-                                    {
-                                        (rebase_arm64_addr(low48).wrapping_add(slide)) as u64
-                                    } else if low48 < ARM64_REBASED_TEXT_BASE as u64 && low48 != 0 {
-                                        (ARM64_REBASED_TEXT_BASE
-                                            .wrapping_add(low48 as u32)
-                                            .wrapping_add(slide)) as u64
-                                    } else {
-                                        old64
-                                    };
-                                    into_mem.write(ptr64, new64);
-                                } else {
-                                    let original_location = Ptr::from_bits(addr);
-                                    let old: u32 = into_mem.read(original_location);
-                                    log_dbg!(
-                                        "Pointer rebase at {:#x} from {:#x} to {:#x}",
-                                        addr,
-                                        old,
-                                        old + slide
-                                    );
-                                    into_mem.write(original_location, old + slide);
-                                }
-                            }
-                            other => {
-                                log!(
-                                    "Warning: unhandled DyldInfo rebase symbol type: {:?}; skipping.",
-                                    other
-                                );
-                            }
-                        }
+                        );
+                        apply_dyld_rebase(
+                            slice,
+                            ptr_size,
+                            is_64bit,
+                            &segment_offsets,
+                            slide,
+                            into_mem,
+                        );
                     }
 
-                    let bind_opcodes = Bind::parse(
-                        checked_dyld_info_slice(
+                    if bind_size > 0 {
+                        let slice = checked_dyld_info_slice(
                             bytes,
                             bind_off as u64,
                             bind_size as u64,
-                            "bind",
-                            &name,
-                        ),
-                        ptr_size,
-                    );
-                    for symb in bind_opcodes {
-                        match symb.symbol_type {
-                            BindSymbolType::Pointer => {
-                                let Some(&seg_base) = segment_offsets.get(symb.segment_index)
-                                else {
-                                    continue;
-                                };
-                                let addr = seg_base
-                                    + symb.symbol_offset as u32
-                                    + slide;
-                                if is_64bit {
-                                    let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
-                                    let addend_u64 = (symb.addend as i32 as u32) as u64;
-                                    into_mem.write(ptr64, addend_u64);
-                                } else if symb.addend != 0 {
-                                    let ptr: MutPtr<u32> = Ptr::from_bits(addr);
-                                    if into_mem.read(ptr) == 0 {
-                                        into_mem.write(ptr, symb.addend as i32 as u32);
-                                    }
-                                }
-                                log_dbg!("Pointer bind: {:#x} -> {} (addend {})", addr, symb.name, symb.addend);
-                                external_relocations.push((addr, symb.name));
-                            }
-                            other => {
-                                log!(
-                                    "Warning: unhandled DyldInfo bind symbol type: {:?}; skipping.",
-                                    other
-                                );
-                            }
-                        }
+                        );
+                        apply_dyld_bind(
+                            slice,
+                            ptr_size,
+                            is_64bit,
+                            false,
+                            false,
+                            &segment_offsets,
+                            slide,
+                            into_mem,
+                            &mut external_relocations,
+                        );
                     }
 
                     if weak_bind_size > 0 {
-                        let weak_bind_opcodes = Bind::parse(
-                            checked_dyld_info_slice(
-                                bytes,
-                                weak_bind_off as u64,
-                                weak_bind_size as u64,
-                                "weak_bind",
-                                &name,
-                            ),
-                            ptr_size,
+                        let slice = checked_dyld_info_slice(
+                            bytes,
+                            weak_bind_off as u64,
+                            weak_bind_size as u64,
                         );
-                        for symb in weak_bind_opcodes {
-                            if matches!(symb.symbol_type, BindSymbolType::Pointer) {
-                                if symb.segment_index < segment_offsets.len() {
-                                    let addr = segment_offsets[symb.segment_index]
-                                        + symb.symbol_offset as u32
-                                        + slide;
-                                    if is_64bit {
-                                        let ptr64: MutPtr<u64> = Ptr::from_bits(addr);
-                                        if into_mem.read(ptr64) == 0 {
-                                            if symb.addend != 0 {
-                                                into_mem.write(
-                                                    ptr64,
-                                                    (symb.addend as i32 as u32) as u64,
-                                                );
-                                            }
-                                            external_relocations.push((addr, symb.name));
-                                        }
-                                    } else {
-                                        let ptr: MutPtr<u32> = Ptr::from_bits(addr);
-                                        if into_mem.read(ptr) == 0 {
-                                            if symb.addend != 0 {
-                                                into_mem.write(ptr, symb.addend as i32 as u32);
-                                            }
-                                            external_relocations.push((addr, symb.name));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        apply_dyld_bind(
+                            slice,
+                            ptr_size,
+                            is_64bit,
+                            true,
+                            false,
+                            &segment_offsets,
+                            slide,
+                            into_mem,
+                            &mut external_relocations,
+                        );
+                    }
+
+                    if let Some((lazy_off, lazy_size)) = find_dyld_lazy_bind_range(bytes, is_64bit) {
+                        let slice = checked_dyld_info_slice(bytes, lazy_off, lazy_size);
+                        apply_dyld_bind(
+                            slice,
+                            ptr_size,
+                            is_64bit,
+                            false,
+                            true,
+                            &segment_offsets,
+                            slide,
+                            into_mem,
+                            &mut external_relocations,
+                        );
                     }
                 }
                 _ => (),
+            }
+        }
+
+        if is_64bit {
+            for (seg_addr, seg_len) in data_segment_ranges {
+                let dst = into_mem.bytes_at_mut(Ptr::from_bits(seg_addr), seg_len);
+                for chunk in dst.chunks_exact_mut(8) {
+                    let raw = u64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ]);
+                    if raw >= ARM64_DEFAULT_TEXT_BASE
+                        && raw < ARM64_DEFAULT_TEXT_BASE + 0x4000_0000
+                    {
+                        let rebased = (rebase_arm64_addr(raw).wrapping_add(slide)) as u64;
+                        chunk.copy_from_slice(&rebased.to_le_bytes());
+                    }
+                }
             }
         }
 

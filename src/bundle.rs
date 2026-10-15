@@ -173,7 +173,7 @@ impl Bundle {
         let base_name = self
             .plist
             .get("UILaunchImageFile")
-            .map(|v| v.as_string().unwrap())
+            .and_then(|v| v.as_string())
             .unwrap_or("Default");
 
         // Try device-specific variants first, then fallback to base name
@@ -396,12 +396,12 @@ impl Bundle {
                 return self
                     .plist
                     .get("NSMainNibFile~ipad")
-                    .map(|v| v.as_string().unwrap());
+                    .and_then(|v| v.as_string());
             }
         }
         self.plist
             .get("NSMainNibFile")
-            .map(|v| v.as_string().unwrap())
+            .and_then(|v| v.as_string())
     }
 
     /// The value of `UIMainStoryboardFile` (or its `~ipad` device-specific
@@ -416,12 +416,12 @@ impl Bundle {
                 return self
                     .plist
                     .get("UIMainStoryboardFile~ipad")
-                    .map(|v| v.as_string().unwrap());
+                    .and_then(|v| v.as_string());
             }
         }
         self.plist
             .get("UIMainStoryboardFile")
-            .map(|v| v.as_string().unwrap())
+            .and_then(|v| v.as_string())
     }
 
     pub fn supported_interface_orientations(&self) -> Vec<&str> {

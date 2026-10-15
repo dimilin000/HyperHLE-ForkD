@@ -2864,7 +2864,15 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
         messagebox::MessageBoxFlag::ERROR,
         &mbox,
         "touchHLE crashed!",
-        &format!("touchHLE crashed with the following error: {error_message}"),
+        &format!(
+            "touchHLE crashed with the following error: {error_message}{}",
+            crate::crash_handler::LAST_PANIC_LOCATION
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .map(|loc| format!("\n(at {loc})"))
+                .unwrap_or_default()
+        ),
         window.map(|win| &win.window),
         None,
     ) else {

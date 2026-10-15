@@ -759,11 +759,13 @@ impl ObjC {
     /// binary.
     fn convert_arm64_class_in_place(
         class: Class,
+        bin_start: u32,
+        bin_end: u32,
         mem: &mut Mem,
         converted: &mut std::collections::HashSet<u32>,
     ) {
         let c_addr = class.to_bits();
-        if c_addr == 0 || !converted.insert(c_addr) {
+        if c_addr < bin_start || c_addr >= bin_end || !converted.insert(c_addr) {
             return;
         }
         let isa_u64: u64 = mem.read(ConstPtr::from_bits(c_addr));
@@ -773,7 +775,7 @@ impl ObjC {
         let superclass: Class = Ptr::from_bits(super_u64 as u32);
         let data_addr: u32 = (data_u64 as u32) & !7;
 
-        if data_addr != 0 && converted.insert(data_addr) {
+        if data_addr >= bin_start && data_addr < bin_end && converted.insert(data_addr) {
             let flags: u32 = mem.read(ConstPtr::from_bits(data_addr));
             let instance_start: u32 = mem.read(ConstPtr::from_bits(data_addr + 4));
             let instance_size: u32 = mem.read(ConstPtr::from_bits(data_addr + 8));
@@ -814,7 +816,10 @@ impl ObjC {
             .copy_from_slice(&cls_bytes);
 
         if isa != nil {
-            Self::convert_arm64_class_in_place(isa, mem, converted);
+            Self::convert_arm64_class_in_place(isa, bin_start, bin_end, mem, converted);
+        }
+        if superclass != nil {
+            Self::convert_arm64_class_in_place(superclass, bin_start, bin_end, mem, converted);
         }
     }
 
@@ -832,7 +837,13 @@ impl ObjC {
             let class: Class = if bin.is_arm64 {
                 let raw: u64 = mem.read(ConstPtr::from_bits(list.addr + i * 8));
                 let cls: Class = Ptr::from_bits(raw as u32);
-                Self::convert_arm64_class_in_place(cls, mem, &mut converted_arm64);
+                Self::convert_arm64_class_in_place(
+                    cls,
+                    bin.text_base,
+                    bin.last_segment_end,
+                    mem,
+                    &mut converted_arm64,
+                );
                 cls
             } else {
                 let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
@@ -936,26 +947,23 @@ impl ObjC {
         for (name, class) in self.classes.iter() {
             log_dbg!("class name {}", name);
             if name == "NSObject" {
-                assert!(!found_ns_object);
                 found_ns_object = true;
             }
-            let class_host_object = self
-                .get_host_object(*class)
-                .unwrap()
-                .as_any()
-                .downcast_ref();
+            let Some(host_obj) = self.get_host_object(*class) else {
+                continue;
+            };
+            let class_host_object = host_obj.as_any().downcast_ref();
             let Some(ClassHostObject { superclass, .. }) = class_host_object else {
                 // Skip FakeClass or UnimplementedClass
                 continue;
             };
 
-            if *superclass != nil {
+            if *superclass != nil && self.get_host_object(*superclass).is_some() {
                 inverted_inheritance
                     .entry(*superclass)
                     .and_modify(|v| v.push(*class))
                     .or_insert(vec![*class]);
-            } else {
-                assert!(!queue.contains(class));
+            } else if !queue.contains(class) {
                 queue.push_back(*class);
             }
         }
@@ -1060,7 +1068,10 @@ impl ObjC {
     }
 
     fn need_ivar_reconciliation(&mut self, class: Class) -> (bool, u32) {
-        let class_host_object = self.get_host_object(class).unwrap().as_any().downcast_ref();
+        let Some(host_obj) = self.get_host_object(class) else {
+            return (false, 0);
+        };
+        let class_host_object = host_obj.as_any().downcast_ref();
         let Some(ClassHostObject {
             name,
             superclass,
@@ -1083,11 +1094,10 @@ impl ObjC {
             return (false, 0);
         }
 
-        let superclass_host_object = self
-            .get_host_object(*superclass)
-            .unwrap()
-            .as_any()
-            .downcast_ref();
+        let Some(super_obj) = self.get_host_object(*superclass) else {
+            return (false, 0);
+        };
+        let superclass_host_object = super_obj.as_any().downcast_ref();
         let Some(ClassHostObject {
             instance_size: superclass_instance_size,
             ..
@@ -1248,7 +1258,10 @@ impl ObjC {
                     continue;
                 }
 
-                let any = self.get_host_object(class).unwrap().as_any();
+                let Some(host_obj) = self.get_host_object(class) else {
+                    continue;
+                };
+                let any = host_obj.as_any();
                 if any.is::<FakeClass>() || any.is::<UnimplementedClass>() {
                     continue;
                 }

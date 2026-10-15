@@ -78,16 +78,23 @@ pub fn append_to_log(msg: &str) {
 /// rarely capture, so panics look like silent aborts (especially on Android,
 /// where a panic unwinding out of a guest-thread coroutine ends in
 /// SIGABRT — see the FATAL SIGNAL marker in the log).
+pub static LAST_PANIC_LOCATION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        let loc_str = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if let Ok(mut guard) = LAST_PANIC_LOCATION.lock() {
+            *guard = Some(loc_str.clone());
+        }
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
         let msg = format!(
             "touchHLE: PANIC in thread \"{}\" at {}: {}\n(panic is followed by unwinding; if this appears right before a FATAL SIGNAL line, the panic crossed a coroutine boundary and aborted the process)",
             thread_name,
-            info.location()
-                .map(|l| format!("{}:{}", l.file(), l.line()))
-                .unwrap_or_else(|| "<unknown>".to_string()),
+            loc_str,
             info.payload()
                 .downcast_ref::<&str>()
                 .map(|s| s.to_string())

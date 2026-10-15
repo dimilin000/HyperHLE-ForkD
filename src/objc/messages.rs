@@ -671,17 +671,12 @@ fn objc_msgSend_inner(
     loop {
         if class == nil {
             assert!(class != orig_class);
-            let (class_name_for_log, is_metaclass) = {
-                let class_host_object = env.objc.get_host_object(orig_class).unwrap();
-                let class_host_object = class_host_object
-                    .as_any()
-                    .downcast_ref::<super::ClassHostObject>()
-                    .unwrap();
-                (
-                    class_host_object.name.clone(),
-                    class_host_object.is_metaclass,
-                )
-            };
+            let (class_name_for_log, is_metaclass) = env
+                .objc
+                .get_host_object(orig_class)
+                .and_then(|h| h.as_any().downcast_ref::<super::ClassHostObject>())
+                .map(|c| (c.name.clone(), c.is_metaclass))
+                .unwrap_or_else(|| ("<unknown>".to_string(), false));
 
             // `+[Class self]` must return the class itself. The real objc
             // runtime resolves `self` via the metaclass root NSObject chain,
