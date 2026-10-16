@@ -904,6 +904,18 @@ impl Environment {
                             let Some(bin) = env.bins.get(bin_idx) else {
                                 continue;
                             };
+
+                            // The CPU runs in the executable's architecture. Do not
+                            // execute initializers from incompatible 32-bit dylibs in
+                            // an ARM64 process.
+                            if executable_is_arm64 && !bin.is_arm64 {
+                                log!(
+                                    "Skipping 32-bit static initializers for {:?} in an arm64 process",
+                                    bin.name
+                                );
+                                continue;
+                            }
+
                             let Some(section) =
                                 bin.get_section(mach_o::SectionType::ModInitFuncPointers)
                             else {

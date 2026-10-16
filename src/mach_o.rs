@@ -814,6 +814,13 @@ fn validate_segment_ranges(commands: &[MachCommand], file_len: usize) -> Result<
             filesize,
             vmsize,
             ..
+        }
+        | LoadCommand::Segment64 {
+            segname,
+            fileoff,
+            filesize,
+            vmsize,
+            ..
         } = command
         {
             // mach_object exposes these fields as usize. Use checked
@@ -1042,6 +1049,11 @@ impl MachO {
                 ref segname,
                 vmaddr,
                 ..
+            }
+            | LoadCommand::Segment64 {
+                ref segname,
+                vmaddr,
+                ..
             } = *cmd
             {
                 if &**segname == "__TEXT" && text_segment_base.is_none() {
@@ -1058,6 +1070,16 @@ impl MachO {
         for MachCommand(command, _size) in commands {
             match command {
                 LoadCommand::Segment {
+                    segname,
+                    vmaddr,
+                    vmsize,
+                    fileoff,
+                    filesize,
+                    initprot,
+                    sections,
+                    ..
+                }
+                | LoadCommand::Segment64 {
                     segname,
                     vmaddr,
                     vmsize,
